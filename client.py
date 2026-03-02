@@ -76,6 +76,7 @@ class MasterDnsVPNClient:
         self.synced_upload_mtu_chars = 0
         self.synced_download_mtu = 0
         self.buffer_size = 65507  # Max UDP payload size
+        self._background_tasks = set()
         self.packet_duplication = self.config.get("PACKET_DUPLICATION_COUNT", 1)
         self.logger.debug("<magenta>[INIT]</magenta> MasterDnsVPNClient initialized.")
 
@@ -118,18 +119,6 @@ class MasterDnsVPNClient:
             )
             conn["packet_loss"] = packet_loss
 
-        valid_connections = [
-            conn
-            for conn in valid_connections
-            if conn["packet_loss"] <= self.skip_resolver_with_packet_loss
-        ]
-
-        if not valid_connections:
-            self.logger.error(
-                "No valid connections available after applying packet loss filter."
-            )
-            return None
-
         selected = None
         if self.resolver_balancing_strategy == 2:
             self.resent_connection_selected = (
@@ -163,23 +152,18 @@ class MasterDnsVPNClient:
 
         targets = [primary_conn]
         if self.packet_duplication > 1:
-            same_domain_conns = [
-                c
-                for c in self.connections_map
-                if c.get("is_valid")
-                and c["domain"] == primary_conn["domain"]
-                and c["resolver"] != primary_conn["resolver"]
-                and c.get("packet_loss", 0) <= self.skip_resolver_with_packet_loss
-            ]
+            valid_conns = [c for c in self.connections_map if c.get("is_valid")]
+            if not valid_conns:
+                valid_conns = [primary_conn]
 
-            if same_domain_conns:
-                if self.resolver_balancing_strategy == 3:  # Lowest Loss
-                    same_domain_conns.sort(key=lambda x: x.get("packet_loss", 0))
-                elif self.resolver_balancing_strategy in (0, 1):  # Random
-                    random.shuffle(same_domain_conns)
+            if self.resolver_balancing_strategy == 3:
+                valid_conns.sort(key=lambda x: x.get("packet_loss", 0))
+            elif self.resolver_balancing_strategy in (0, 1):
+                random.shuffle(valid_conns)
 
-                needed = self.packet_duplication - 1
-                targets.extend(same_domain_conns[:needed])
+            needed = self.packet_duplication - 1
+            for i in range(needed):
+                targets.append(valid_conns[i % len(valid_conns)])
 
         return targets
 
@@ -864,7 +848,7 @@ class MasterDnsVPNClient:
         await self.outbound_queue.put(
             (2, self.loop.time(), Packet_Type.STREAM_SYN, stream_id, 0, b"")
         )
-        self.pending_streams[stream_id] = (reader, writer)
+        self.pending_streams[stream_id] = (reader, writer, self.loop.time())
 
     async def _client_enqueue_tx(
         self, priority, stream_id, sn, data, is_ack=False, is_fin=False, is_resend=False
@@ -897,11 +881,11 @@ class MasterDnsVPNClient:
                 )
 
                 if idle_duration < 2.0:
-                    current_timeout = 0.5
+                    current_timeout = 0.1
                 elif idle_duration < 10.0:
-                    current_timeout = 1.0
+                    current_timeout = 0.5
                 else:
-                    current_timeout = 5.0
+                    current_timeout = 2.0
 
                 if not self.active_streams and not self.pending_streams:
                     (
@@ -1000,7 +984,7 @@ class MasterDnsVPNClient:
 
         if ptype == Packet_Type.STREAM_SYN_ACK:
             if stream_id in self.pending_streams:
-                reader, writer = self.pending_streams.pop(stream_id)
+                reader, writer, ptime = self.pending_streams.pop(stream_id)
                 from dns_utils.ARQ import ARQStream
 
                 stream = ARQStream(
@@ -1045,29 +1029,62 @@ class MasterDnsVPNClient:
 
     async def _retransmit_worker(self):
         self.logger.debug("<magenta>[RETRANS]</magenta> Retransmit Worker started.")
+        SYN_RETRY_INTERVAL = 8.0
+        SYN_MAX_AGE = 120.0
+        syn_last_sent = {}  # sid -> timestamp
+
         while not self.should_stop.is_set():
             await asyncio.sleep(0.1)
 
+            # Clean up closed active streams
             dead_streams = [sid for sid, s in self.active_streams.items() if s.closed]
             for sid in dead_streams:
                 self.logger.info(f"<y>Stream {sid} Closed by local client.</y>")
-                self.active_streams.pop(sid, None)
+                stream = self.active_streams.pop(sid, None)
+                if stream and hasattr(stream, "io_task") and not stream.io_task.done():
+                    stream.io_task.cancel()
+                    self._background_tasks.add(stream.io_task)
+                    stream.io_task.add_done_callback(self._background_tasks.discard)
 
+            # Handle pending streams (SYN retry + EOF detection)
             dead_pending = []
-            for sid, (reader, writer) in self.pending_streams.items():
+            now = self.loop.time()
+
+            for sid, (reader, writer, syn_time) in list(self.pending_streams.items()):
+                # Check if local client already closed the connection
                 if reader.at_eof() or writer.is_closing():
                     dead_pending.append(sid)
                     try:
                         writer.close()
                     except Exception:
                         pass
+                    continue
+
+                age = now - syn_time
+                if age > SYN_MAX_AGE:
+                    dead_pending.append(sid)
+                    try:
+                        writer.close()
+                    except Exception:
+                        pass
+                    continue
+
+                # Retry SYN if not recently sent
+                if now - syn_last_sent.get(sid, 0) > SYN_RETRY_INTERVAL:
+                    syn_last_sent[sid] = now
+                    await self.outbound_queue.put(
+                        (2, self.loop.time(), Packet_Type.STREAM_SYN, sid, 0, b"")
+                    )
+
             for sid in dead_pending:
                 self.logger.info(
                     f"<y>Pending Stream {sid} aborted by local client.</y>"
                 )
                 del self.pending_streams[sid]
+                syn_last_sent.pop(sid, None)  # Clean up tracking
                 await self._client_enqueue_tx(2, sid, 0, b"", is_fin=True)
 
+            # Retransmit unacked packets for active streams
             for stream in self.active_streams.values():
                 await stream.check_retransmits()
 

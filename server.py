@@ -57,6 +57,7 @@ class MasterDnsVPNServer:
 
         self._dns_task = None
         self._session_cleanup_task = None
+        self._background_tasks = set()
 
     # ---------------------------------------------------------
     # Session Management
@@ -430,7 +431,9 @@ class MasterDnsVPNServer:
                 self.logger.exception(f"Unexpected error receiving DNS request: {e}")
                 continue
             try:
-                self.loop.create_task(self._bounded_handle_request(data, addr))
+                task = self.loop.create_task(self._bounded_handle_request(data, addr))
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
             except Exception as e:
                 self.logger.error(f"Failed to create task for request from {addr}: {e}")
 
@@ -658,10 +661,15 @@ class MasterDnsVPNServer:
             await asyncio.sleep(0.1)
             for session_id, session in list(self.sessions.items()):
                 streams = session.get("streams", {})
-                # Cleanup closed streams to avoid memory leaks
+
                 dead_streams = [sid for sid, s in streams.items() if s.closed]
                 for sid in dead_streams:
-                    del streams[sid]
+                    stream = streams.pop(sid)
+                    if hasattr(stream, "io_task") and not stream.io_task.done():
+                        stream.io_task.cancel()
+                        self._background_tasks.add(stream.io_task)
+                        stream.io_task.add_done_callback(self._background_tasks.discard)
+
                 for stream in streams.values():
                     await stream.check_retransmits()
 

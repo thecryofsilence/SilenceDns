@@ -27,15 +27,15 @@ class ARQStream:
         self.rttval = 0.0  # RTT Variance
 
         # 1. Flow Control (Congestion Window)
-        self.cwnd = 100
-        self.ssthresh = 200
+        self.cwnd = 300
+        self.ssthresh = 300
 
         # 2. Fast Retransmit Tracking
         self.dup_acks = {}
 
         self.last_activity = time.time()
 
-        self.rto = 2.0  # Base Retransmission Timeout
+        self.rto = 10.0  # Base Retransmission Timeout
         self.closed = False
         self.io_task = asyncio.create_task(self._io_loop())
         self.logger = logger
@@ -90,9 +90,14 @@ class ARQStream:
                 )
         finally:
             if not self.closed:
+                self.closed = True
                 try:
-                    loop = asyncio.get_running_loop()
-                    loop.create_task(self.close(reason="IO Loop Ended"))
+                    await self.enqueue_tx(2, self.stream_id, 0, b"", is_fin=True)
+                except Exception:
+                    pass
+                try:
+                    if not self.writer.is_closing():
+                        self.writer.close()
                 except Exception:
                     pass
 
@@ -161,7 +166,9 @@ class ARQStream:
                         self.rttval = 0.75 * self.rttval + 0.25 * abs(self.srtt - rtt)
                         self.srtt = 0.875 * self.srtt + 0.125 * rtt
 
-                    self.rto = max(1.0, min(self.srtt + max(0.1, 4 * self.rttval), 5.0))
+                    self.rto = max(
+                        5.0, min(self.srtt + max(2.0, 4 * self.rttval), 45.0)
+                    )
 
                 del self.snd_buf[k]
 
@@ -180,7 +187,7 @@ class ARQStream:
                 self.dup_acks[lost_sn] = self.dup_acks.get(lost_sn, 0) + 1
 
                 if self.dup_acks[lost_sn] == 3:
-                    self.ssthresh = max(int(self.cwnd * 0.8), 50)
+                    self.ssthresh = max(int(self.cwnd * 0.8), 100)
                     self.cwnd = self.ssthresh
                     self.dup_acks[lost_sn] = 0
 
@@ -202,14 +209,14 @@ class ARQStream:
             return
 
         for sn, pkt in list(self.snd_buf.items()):
-            current_rto = min(self.rto * (1.5 ** pkt["retries"]), 3.0)
+            current_rto = min(self.rto * (1.5 ** pkt["retries"]), 60.0)
 
             if now - pkt["time"] > current_rto:
                 pkt["time"] = now
                 pkt["retries"] += 1
 
-                self.ssthresh = max(int(self.cwnd * 0.5), 50)
-                self.cwnd = max(self.cwnd, 50)
+                self.ssthresh = max(int(self.cwnd * 0.5), 100)
+                self.cwnd = max(self.cwnd, 100)
 
                 # Priority 1 for RESEND
                 await self.enqueue_tx(
