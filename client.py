@@ -367,8 +367,14 @@ class MasterDnsVPNClient:
         packet_type = parsed_header["packet_type"] if parsed_header else None
 
         if packet_type == Packet_Type.MTU_UP_RES:
+            self.logger.info(
+                f"<green>Upload Test Success: {mtu_size}B ({mtu_char_len} chars) via {dns_server} for {domain}</green>"
+            )
             return True
         elif packet_type == Packet_Type.ERROR_DROP:
+            self.logger.info(
+                f"<yellow>Upload Test Dropped (Server MTU Limit): {mtu_size}B via {dns_server} for {domain}</yellow>"
+            )
             return False
         return False
 
@@ -405,8 +411,14 @@ class MasterDnsVPNClient:
 
         if packet_type == Packet_Type.MTU_DOWN_RES:
             if returned_data and len(returned_data) == mtu_size:
+                self.logger.info(
+                    f"<green>Download Test Success: {mtu_size}B via {dns_server} for {domain}</green>"
+                )
                 return True
             else:
+                self.logger.info(
+                    f"<yellow>Download Test Failed (Data Mismatch): {mtu_size}B via {dns_server} for {domain}</yellow>"
+                )
                 return False
         return False
 
@@ -484,7 +496,7 @@ class MasterDnsVPNClient:
                 self.min_upload_mtu > 0 and up_mtu_bytes < self.min_upload_mtu
             ):
                 self.logger.warning(
-                    f"Connection invalid for {domain} via {resolver}: Upload MTU failed."
+                    f"<red>❌ Connection invalid for {domain} via {resolver}: Upload MTU failed.</red>"
                 )
                 continue
 
@@ -497,7 +509,7 @@ class MasterDnsVPNClient:
                 self.min_download_mtu > 0 and down_mtu_bytes < self.min_download_mtu
             ):
                 self.logger.warning(
-                    f"Connection invalid for {domain} via {resolver}: Download MTU failed."
+                    f"<red>❌ Connection invalid for {domain} via {resolver}: Download MTU failed.</red>"
                 )
                 continue
 
@@ -509,8 +521,8 @@ class MasterDnsVPNClient:
             connection["packet_loss"] = 0
 
             self.logger.info(
-                f"<green>Valid: <cyan>{domain}</cyan> via <cyan>{resolver}</cyan> | "
-                f"UP: {up_mtu_bytes}B ({up_mtu_char}c) | DOWN: {down_mtu_bytes}B</green>"
+                f"<cyan>✅ Valid: {domain} via <green>{resolver}</green> | "
+                f"Upload MTU: <red>{up_mtu_bytes}</red> | Download MTU: <red>{down_mtu_bytes}</red></cyan>"
             )
 
         valid_conns = [c for c in self.connections_map if c.get("is_valid")]
@@ -833,23 +845,30 @@ class MasterDnsVPNClient:
         finally:
             self.logger.info("Cleaning up tunnel resources...")
 
+            for w in getattr(self, "workers", []):
+                if not w.done():
+                    w.cancel()
+
             if server:
                 try:
                     server.close()
-                    await server.wait_closed()
+                    await asyncio.wait_for(server.wait_closed(), timeout=1.0)
                 except Exception:
                     pass
 
-            for w in getattr(self, "workers", []):
-                w.cancel()
-
+            close_tasks = []
             for sid in list(self.active_streams.keys()):
+                close_tasks.append(self.close_stream(sid, reason="Client App Closing"))
+
+            if close_tasks:
                 try:
                     await asyncio.wait_for(
-                        self.close_stream(sid, reason="Client App Closing"), timeout=1.5
+                        asyncio.gather(*close_tasks, return_exceptions=True),
+                        timeout=1.5,
                     )
                 except Exception:
                     pass
+
             self.active_streams.clear()
 
             if hasattr(self, "tunnel_sock") and self.tunnel_sock:
@@ -895,9 +914,9 @@ class MasterDnsVPNClient:
         try:
             if writer and not writer.is_closing():
                 writer.close()
-                await asyncio.wait_for(writer.wait_closed(), timeout=3.0)
-        except Exception as e:
-            self.logger.debug(f"Error closing writer: {e}")
+                await asyncio.wait_for(writer.wait_closed(), timeout=0.5)
+        except Exception:
+            pass
 
     def _new_get_stream_id(self):
         start = (self.last_stream_id + 1) or 1
@@ -920,6 +939,12 @@ class MasterDnsVPNClient:
         return False, 0
 
     async def _handle_local_tcp_connection(self, reader, writer):
+        if self.should_stop.is_set() or (
+            self.session_restart_event and self.session_restart_event.is_set()
+        ):
+            await self._close_writer_safely(writer)
+            return
+
         stream_id_status, stream_id = self._new_get_stream_id()
         if not stream_id_status:
             self.logger.error("No available Stream IDs! Too many connections.")
@@ -929,9 +954,14 @@ class MasterDnsVPNClient:
         self.logger.info(f"New local connection, assigning Stream ID: {stream_id}")
 
         now = self.loop.time()
-        await self.outbound_queue.put(
-            (2, now, Packet_Type.STREAM_SYN, stream_id, 0, b"")
-        )
+        try:
+            self.outbound_queue.put_nowait(
+                (2, now, Packet_Type.STREAM_SYN, stream_id, 0, b"")
+            )
+        except asyncio.QueueFull:
+            self.logger.debug("Queue is full, dropping new connection.")
+            await self._close_writer_safely(writer)
+            return
 
         self.active_streams[stream_id] = {
             "reader": reader,
@@ -944,7 +974,7 @@ class MasterDnsVPNClient:
 
     async def _clear_stream_from_queue(self, stream_id: int):
         """Removes all packets of a specific stream from the outbound queue except FIN."""
-        if self.outbound_queue.empty():
+        if not hasattr(self, "outbound_queue") or self.outbound_queue.empty():
             return
 
         items = []
@@ -957,13 +987,21 @@ class MasterDnsVPNClient:
                 break
 
         for item in items:
-            await self.outbound_queue.put(item)
+            try:
+                self.outbound_queue.put_nowait(item)
+            except asyncio.QueueFull:
+                pass
 
         self.logger.debug(f"Queue cleared for Stream {stream_id}")
 
     async def _client_enqueue_tx(
         self, priority, stream_id, sn, data, is_ack=False, is_fin=False, is_resend=False
     ):
+        if self.should_stop.is_set() or (
+            self.session_restart_event and self.session_restart_event.is_set()
+        ):
+            return
+
         ptype = Packet_Type.STREAM_DATA
         effective_priority = 3
 
@@ -977,9 +1015,12 @@ class MasterDnsVPNClient:
             ptype = Packet_Type.STREAM_RESEND if is_resend else ptype
             effective_priority = 2
 
-        await self.outbound_queue.put(
-            (effective_priority, self.loop.time(), ptype, stream_id, sn, data)
-        )
+        try:
+            self.outbound_queue.put_nowait(
+                (effective_priority, self.loop.time(), ptype, stream_id, sn, data)
+            )
+        except asyncio.QueueFull:
+            pass
 
     async def _tx_worker(self):
         self.logger.debug("<magenta>[TX]</magenta> TX Worker started.")
@@ -1151,11 +1192,10 @@ class MasterDnsVPNClient:
             await self.close_stream(stream_id, reason="Server sent FIN")
 
         elif ptype == Packet_Type.ERROR_DROP:
-            self.logger.error(
-                "<red>Session dropped by server (Server Restarted or Invalid). Reconnecting...</red>"
-            )
-
-            if self.session_restart_event:
+            if not self.session_restart_event.is_set():
+                self.logger.error(
+                    "<red>Session dropped by server (Server Restarted or Invalid). Reconnecting...</red>"
+                )
                 self.session_restart_event.set()
 
     async def close_stream(self, stream_id: int, reason: str = "Unknown") -> None:

@@ -94,8 +94,18 @@ class MasterDnsVPNServer:
         self.logger.debug(f"Closing Session {session_id} and all its streams...")
 
         stream_ids = list(session.get("streams", {}).keys())
-        for sid in stream_ids:
-            await self.close_stream(session_id, sid, reason="Session Closing")
+        close_tasks = [
+            self.close_stream(session_id, sid, reason="Session Closing")
+            for sid in stream_ids
+        ]
+
+        if close_tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*close_tasks, return_exceptions=True), timeout=2.0
+                )
+            except Exception:
+                pass
 
         out_queue = session.get("outbound_queue")
         if out_queue:
@@ -861,42 +871,25 @@ class MasterDnsVPNServer:
     async def stop(self) -> None:
         """Signal the server to stop."""
         self.should_stop.set()
-        for session_id in list(self.sessions.keys()):
-            await self._close_session(session_id)
 
-        try:
-            if getattr(self, "_retransmit_task", None):
-                self._retransmit_task.cancel()
-        except Exception:
-            pass
+        for task in list(self._background_tasks):
+            if not task.done():
+                task.cancel()
 
-        try:
-            if getattr(self, "_dns_task", None):
-                self._dns_task.cancel()
-        except Exception:
-            pass
+        for task_name in ["_retransmit_task", "_dns_task", "_session_cleanup_task"]:
+            task = getattr(self, task_name, None)
+            if task and not task.done():
+                task.cancel()
 
-        try:
-            if getattr(self, "_session_cleanup_task", None):
-                self._session_cleanup_task.cancel()
-        except Exception:
-            pass
-
-        try:
-            await asyncio.gather(
-                *(
-                    t
-                    for t in (
-                        getattr(self, "_dns_task", None),
-                        getattr(self, "_session_cleanup_task", None),
-                        getattr(self, "_retransmit_task", None),
-                    )
-                    if t
-                ),
-                return_exceptions=True,
-            )
-        except Exception:
-            pass
+        session_ids = list(self.sessions.keys())
+        close_tasks = [self._close_session(sid) for sid in session_ids]
+        if close_tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*close_tasks, return_exceptions=True), timeout=3.0
+                )
+            except Exception:
+                pass
 
         if self.udp_sock:
             try:

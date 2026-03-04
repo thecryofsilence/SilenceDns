@@ -34,7 +34,7 @@ class ARQStream:
         self.rcv_buf = {}
 
         self.last_activity = time.time()
-        self.rto = 2.0
+        self.rto = 1.0
         self.closed = False
         self.logger = logger
         self._fin_sent = False
@@ -202,7 +202,7 @@ class ARQStream:
             ):
                 self.writer.close()
                 try:
-                    await asyncio.wait_for(self.writer.wait_closed(), timeout=3.0)
+                    await asyncio.wait_for(self.writer.wait_closed(), timeout=0.5)
                 except Exception:
                     pass
         except Exception:
