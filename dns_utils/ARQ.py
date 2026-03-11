@@ -64,6 +64,7 @@ class ARQ:
         self.limit = max(50, int(self.window_size * 0.8))
         self.window_not_full = asyncio.Event()
         self.window_not_full.set()
+        self._write_lock = asyncio.Lock()
 
         self.is_socks = is_socks
         self.initial_data = initial_data
@@ -231,8 +232,9 @@ class ARQ:
 
         if has_written:
             try:
-                _write(b"".join(data_to_write))
-                await self.writer.drain()
+                async with self._write_lock:
+                    _write(b"".join(data_to_write))
+                    await self.writer.drain()
             except Exception as e:
                 await self.close(reason=f"Writer Error: {e}")
                 return
