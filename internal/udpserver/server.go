@@ -306,25 +306,34 @@ func (s *Server) handleTunnelCandidate(packet []byte, parsed DnsParser.LitePacke
 		return response
 	}
 	if !isPreSessionRequestType(vpnPacket.PacketType) {
-		expectedCookie, hasExpectedCookie := s.sessions.ExpectedCookie(vpnPacket.SessionID)
+		lookup, hasExpectedCookie := s.sessions.Lookup(vpnPacket.SessionID)
 		if !s.sessions.ValidateCookie(vpnPacket.SessionID, vpnPacket.SessionCookie) {
 			var expectedCookiePtr *uint8
 			if hasExpectedCookie {
-				expectedCookiePtr = &expectedCookie
+				expectedCookiePtr = &lookup.Cookie
 			}
-			if s.invalidCookieTracker.Note(
+			shouldEmit := s.invalidCookieTracker.Note(
 				vpnPacket.SessionID,
 				expectedCookiePtr,
 				vpnPacket.SessionCookie,
+				lookup.State,
 				time.Now(),
 				s.cfg.InvalidCookieWindow(),
 				s.cfg.InvalidCookieErrorThreshold,
-			) {
-				if hasExpectedCookie {
+			)
+			if shouldEmit {
+				if hasExpectedCookie && lookup.State == sessionLookupClosed {
+					s.log.Warnf(
+						"🧷 <yellow>Stale Closed Session Cookie Threshold Reached</yellow> <magenta>|</magenta> <blue>Session</blue>: <cyan>%d</cyan> <magenta>|</magenta> <blue>Expected</blue>: <cyan>%d</cyan> <magenta>|</magenta> <blue>Received</blue>: <cyan>%d</cyan>",
+						vpnPacket.SessionID,
+						lookup.Cookie,
+						vpnPacket.SessionCookie,
+					)
+				} else if hasExpectedCookie {
 					s.log.Warnf(
 						"🧷 <yellow>Invalid Session Cookie Threshold Reached</yellow> <magenta>|</magenta> <blue>Session</blue>: <cyan>%d</cyan> <magenta>|</magenta> <blue>Expected</blue>: <cyan>%d</cyan> <magenta>|</magenta> <blue>Received</blue>: <cyan>%d</cyan>",
 						vpnPacket.SessionID,
-						expectedCookie,
+						lookup.Cookie,
 						vpnPacket.SessionCookie,
 					)
 				} else {
@@ -333,6 +342,11 @@ func (s *Server) handleTunnelCandidate(packet []byte, parsed DnsParser.LitePacke
 						vpnPacket.SessionID,
 						vpnPacket.SessionCookie,
 					)
+				}
+				if hasExpectedCookie {
+					if response := s.buildInvalidSessionErrorResponse(packet, decision.RequestName, vpnPacket.SessionID, lookup.ResponseMode); len(response) != 0 {
+						return response
+					}
 				}
 			}
 			return nil
@@ -354,6 +368,24 @@ func (s *Server) handleTunnelCandidate(packet []byte, parsed DnsParser.LitePacke
 		}
 		return response
 	}
+}
+
+func (s *Server) buildInvalidSessionErrorResponse(questionPacket []byte, requestName string, sessionID uint8, responseMode uint8) []byte {
+	payload := make([]byte, 8)
+	copy(payload, []byte{'I', 'N', 'V'})
+	if _, err := rand.Read(payload[3:]); err != nil {
+		return nil
+	}
+
+	response, err := DnsParser.BuildVPNResponsePacket(questionPacket, requestName, VpnProto.Packet{
+		SessionID:  sessionID,
+		PacketType: Enums.PACKET_ERROR_DROP,
+		Payload:    payload,
+	}, responseMode == mtuProbeModeBase64)
+	if err != nil {
+		return nil
+	}
+	return response
 }
 
 func isPreSessionRequestType(packetType uint8) bool {

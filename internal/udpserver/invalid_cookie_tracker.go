@@ -16,6 +16,7 @@ type invalidCookieTrackerKey struct {
 	sessionID      uint8
 	expectedCookie uint16
 	packetCookie   uint8
+	state          uint8
 }
 
 type invalidCookieTrackerRecord struct {
@@ -36,7 +37,7 @@ func newInvalidCookieTracker() *invalidCookieTracker {
 	}
 }
 
-func (t *invalidCookieTracker) Note(sessionID uint8, expectedCookie *uint8, packetCookie uint8, now time.Time, window time.Duration, threshold int) bool {
+func (t *invalidCookieTracker) Note(sessionID uint8, expectedCookie *uint8, packetCookie uint8, state sessionLookupState, now time.Time, window time.Duration, threshold int) bool {
 	if t == nil || window <= 0 || threshold <= 0 {
 		return false
 	}
@@ -52,6 +53,7 @@ func (t *invalidCookieTracker) Note(sessionID uint8, expectedCookie *uint8, pack
 		sessionID:      sessionID,
 		expectedCookie: expected,
 		packetCookie:   packetCookie,
+		state:          uint8(state),
 	}
 
 	t.mu.Lock()

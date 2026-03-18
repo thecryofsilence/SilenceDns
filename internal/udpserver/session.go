@@ -43,8 +43,23 @@ type sessionRecord struct {
 }
 
 type closedSessionRecord struct {
-	Cookie    uint8
-	ExpiresAt time.Time
+	Cookie       uint8
+	ResponseMode uint8
+	ExpiresAt    time.Time
+}
+
+type sessionLookupState uint8
+
+const (
+	sessionLookupUnknown sessionLookupState = iota
+	sessionLookupActive
+	sessionLookupClosed
+)
+
+type sessionLookupResult struct {
+	Cookie       uint8
+	ResponseMode uint8
+	State        sessionLookupState
 }
 
 type sessionStore struct {
@@ -146,17 +161,33 @@ func (s *sessionStore) Active(sessionID uint8) (*sessionRecord, bool) {
 	return &copyRecord, true
 }
 
-func (s *sessionStore) ExpectedCookie(sessionID uint8) (uint8, bool) {
+func (s *sessionStore) Lookup(sessionID uint8) (sessionLookupResult, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if record := s.byID[sessionID]; record != nil {
-		return record.Cookie, true
+		return sessionLookupResult{
+			Cookie:       record.Cookie,
+			ResponseMode: record.ResponseMode,
+			State:        sessionLookupActive,
+		}, true
 	}
 	if record, ok := s.recentClosed[sessionID]; ok {
-		return record.Cookie, true
+		return sessionLookupResult{
+			Cookie:       record.Cookie,
+			ResponseMode: record.ResponseMode,
+			State:        sessionLookupClosed,
+		}, true
 	}
-	return 0, false
+	return sessionLookupResult{}, false
+}
+
+func (s *sessionStore) ExpectedCookie(sessionID uint8) (uint8, bool) {
+	info, ok := s.Lookup(sessionID)
+	if !ok {
+		return 0, false
+	}
+	return info.Cookie, true
 }
 
 func (s *sessionStore) ValidateCookie(sessionID uint8, cookie uint8) bool {
@@ -180,8 +211,9 @@ func (s *sessionStore) Close(sessionID uint8, now time.Time, retention time.Dura
 	s.byID[sessionID] = nil
 	if retention > 0 {
 		s.recentClosed[sessionID] = closedSessionRecord{
-			Cookie:    record.Cookie,
-			ExpiresAt: now.Add(retention),
+			Cookie:       record.Cookie,
+			ResponseMode: record.ResponseMode,
+			ExpiresAt:    now.Add(retention),
 		}
 	} else {
 		delete(s.recentClosed, sessionID)
@@ -218,8 +250,9 @@ func (s *sessionStore) Cleanup(now time.Time, idleTimeout time.Duration, closedR
 		s.byID[sessionID] = nil
 		if closedRetention > 0 {
 			s.recentClosed[uint8(sessionID)] = closedSessionRecord{
-				Cookie:    record.Cookie,
-				ExpiresAt: now.Add(closedRetention),
+				Cookie:       record.Cookie,
+				ResponseMode: record.ResponseMode,
+				ExpiresAt:    now.Add(closedRetention),
 			}
 		}
 		expired = append(expired, uint8(sessionID))

@@ -451,6 +451,13 @@ func TestSessionStoreCleanupMovesExpiredSessionToRecentClosed(t *testing.T) {
 	if cookie, ok := store.ExpectedCookie(record.ID); !ok || cookie != expectedCookie {
 		t.Fatalf("recently closed cookie missing: ok=%v cookie=%d expected=%d", ok, cookie, expectedCookie)
 	}
+	lookup, ok := store.Lookup(record.ID)
+	if !ok || lookup.State != sessionLookupClosed {
+		t.Fatalf("expected closed lookup state, ok=%v state=%v", ok, lookup.State)
+	}
+	if lookup.ResponseMode != record.ResponseMode {
+		t.Fatalf("recently closed response mode mismatch: got=%d want=%d", lookup.ResponseMode, record.ResponseMode)
+	}
 }
 
 func TestSessionStoreTouchRefreshesActivity(t *testing.T) {
@@ -474,6 +481,60 @@ func TestSessionStoreTouchRefreshesActivity(t *testing.T) {
 	}
 	if !active.LastActivityAt.After(old) {
 		t.Fatal("last activity timestamp was not updated")
+	}
+}
+
+func TestHandlePacketReturnsInvalidSessionErrorForRecentlyClosedCookieThreshold(t *testing.T) {
+	codec, err := security.NewCodec(0, "")
+	if err != nil {
+		t.Fatalf("NewCodec returned error: %v", err)
+	}
+
+	srv := New(config.ServerConfig{
+		MaxPacketSize:               65535,
+		Domain:                      []string{"a.com"},
+		MinVPNLabelLength:           3,
+		InvalidCookieErrorThreshold: 1,
+		InvalidCookieWindowSecs:     2.0,
+		ClosedSessionRetentionSecs:  600.0,
+	}, nil, codec)
+
+	verifyCode := []byte{0x44, 0x33, 0x22, 0x11}
+	initPayload := []byte{
+		1,
+		0x00,
+		0x00, 0x96,
+		0x00, 0xC8,
+		verifyCode[0], verifyCode[1], verifyCode[2], verifyCode[3],
+	}
+
+	initResponse := srv.handlePacket(buildTunnelQueryWithSessionID(t, codec, "a.com", 0, Enums.PACKET_SESSION_INIT, initPayload))
+	packet, err := DnsParser.ExtractVPNResponse(initResponse, true)
+	if err != nil {
+		t.Fatalf("ExtractVPNResponse returned error: %v", err)
+	}
+
+	sessionID := packet.Payload[0]
+	validCookie := packet.Payload[1]
+	if !srv.sessions.Close(sessionID, time.Now(), 10*time.Minute) {
+		t.Fatal("expected session to close")
+	}
+
+	staleQuery := buildTunnelQueryWithCookie(t, codec, "a.com", sessionID, validCookie+1, Enums.PACKET_PING, nil)
+	response := srv.handlePacket(staleQuery)
+	if len(response) == 0 {
+		t.Fatal("recently closed invalid cookie packet should get an error response after threshold")
+	}
+
+	errorPacket, err := DnsParser.ExtractVPNResponse(response, true)
+	if err != nil {
+		t.Fatalf("ExtractVPNResponse returned error: %v", err)
+	}
+	if errorPacket.PacketType != Enums.PACKET_ERROR_DROP {
+		t.Fatalf("unexpected packet type: got=%d want=%d", errorPacket.PacketType, Enums.PACKET_ERROR_DROP)
+	}
+	if errorPacket.SessionID != sessionID {
+		t.Fatalf("unexpected session id: got=%d want=%d", errorPacket.SessionID, sessionID)
 	}
 }
 
