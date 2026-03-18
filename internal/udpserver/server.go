@@ -42,6 +42,7 @@ type Server struct {
 	codec                   *security.Codec
 	domainMatcher           *domainmatcher.Matcher
 	sessions                *sessionStore
+	streams                 *streamStateStore
 	invalidCookieTracker    *invalidCookieTracker
 	dnsCache                *dnscache.Store
 	dnsResolveInflight      *dnsResolveInflightManager
@@ -69,6 +70,7 @@ func New(cfg config.ServerConfig, log *logger.Logger, codec *security.Codec) *Se
 		codec:                codec,
 		domainMatcher:        domainmatcher.New(cfg.Domain, cfg.MinVPNLabelLength),
 		sessions:             newSessionStore(),
+		streams:              newStreamStateStore(),
 		invalidCookieTracker: newInvalidCookieTracker(),
 		dnsCache: dnscache.New(
 			cfg.DNSCacheMaxRecords,
@@ -190,6 +192,9 @@ func (s *Server) sessionCleanupLoop(ctx context.Context) {
 			s.purgeDNSQueryFragments(now)
 			if len(expired) == 0 {
 				continue
+			}
+			for _, sessionID := range expired {
+				s.streams.RemoveSession(sessionID)
 			}
 			s.log.Infof(
 				"🧹 <green>Expired Sessions Cleaned</green> <magenta>|</magenta> <blue>Count</blue>: <cyan>%d</cyan>",
@@ -374,6 +379,16 @@ func (s *Server) handleTunnelCandidate(packet []byte, parsed DnsParser.LitePacke
 		return s.handlePingRequest(packet, decision, vpnPacket)
 	case Enums.PACKET_DNS_QUERY_REQ:
 		return s.handleDNSQueryRequest(packet, parsed, decision, vpnPacket)
+	case Enums.PACKET_STREAM_SYN:
+		return s.handleStreamSynRequest(packet, decision, vpnPacket)
+	case Enums.PACKET_STREAM_DATA, Enums.PACKET_STREAM_RESEND:
+		return s.handleStreamDataRequest(packet, decision, vpnPacket)
+	case Enums.PACKET_STREAM_FIN:
+		return s.handleStreamFinRequest(packet, decision, vpnPacket)
+	case Enums.PACKET_STREAM_RST:
+		return s.handleStreamRSTRequest(packet, decision, vpnPacket)
+	case Enums.PACKET_STREAM_DATA_ACK, Enums.PACKET_STREAM_FIN_ACK, Enums.PACKET_STREAM_RST_ACK, Enums.PACKET_STREAM_SYN_ACK:
+		return s.handleStreamAckPacket(packet, decision, vpnPacket)
 	default:
 		return buildNoDataResponseLite(packet, parsed)
 	}
@@ -415,6 +430,19 @@ func (s *Server) buildInvalidSessionErrorResponse(questionPacket []byte, request
 		PacketType: Enums.PACKET_ERROR_DROP,
 		Payload:    payload,
 	}, responseMode == mtuProbeModeBase64)
+	if err != nil {
+		return nil
+	}
+	return response
+}
+
+func (s *Server) buildSessionVPNResponse(questionPacket []byte, requestName string, record *sessionRecord, packet VpnProto.Packet) []byte {
+	if record == nil {
+		return nil
+	}
+	packet.SessionID = record.ID
+	packet.SessionCookie = record.Cookie
+	response, err := DnsParser.BuildVPNResponsePacket(questionPacket, requestName, packet, record.ResponseMode == mtuProbeModeBase64)
 	if err != nil {
 		return nil
 	}
@@ -583,16 +611,10 @@ func (s *Server) handlePingRequest(questionPacket []byte, decision domainmatcher
 	}
 	payload = append(payload, randomPart...)
 
-	response, err := DnsParser.BuildVPNResponsePacket(questionPacket, decision.RequestName, VpnProto.Packet{
-		SessionID:     sessionRecord.ID,
-		SessionCookie: sessionRecord.Cookie,
-		PacketType:    Enums.PACKET_PONG,
-		Payload:       payload,
-	}, sessionRecord.ResponseMode == mtuProbeModeBase64)
-	if err != nil {
-		return nil
-	}
-	return response
+	return s.buildSessionVPNResponse(questionPacket, decision.RequestName, sessionRecord, VpnProto.Packet{
+		PacketType: Enums.PACKET_PONG,
+		Payload:    payload,
+	})
 }
 
 func (s *Server) handleDNSQueryRequest(questionPacket []byte, parsed DnsParser.LitePacket, decision domainmatcher.Decision, vpnPacket VpnProto.Packet) []byte {
@@ -642,9 +664,7 @@ func (s *Server) handleDNSQueryRequest(questionPacket []byte, parsed DnsParser.L
 		return nil
 	}
 
-	response, err := DnsParser.BuildVPNResponsePacket(questionPacket, decision.RequestName, VpnProto.Packet{
-		SessionID:       sessionRecord.ID,
-		SessionCookie:   sessionRecord.Cookie,
+	return s.buildSessionVPNResponse(questionPacket, decision.RequestName, sessionRecord, VpnProto.Packet{
 		PacketType:      Enums.PACKET_DNS_QUERY_RES,
 		StreamID:        0,
 		SequenceNum:     vpnPacket.SequenceNum,
@@ -652,9 +672,108 @@ func (s *Server) handleDNSQueryRequest(questionPacket []byte, parsed DnsParser.L
 		TotalFragments:  1,
 		CompressionType: sessionRecord.DownloadCompression,
 		Payload:         rawResponse,
-	}, sessionRecord.ResponseMode == mtuProbeModeBase64)
-	if err != nil {
+	})
+}
+
+func (s *Server) handleStreamSynRequest(questionPacket []byte, decision domainmatcher.Decision, vpnPacket VpnProto.Packet) []byte {
+	if !vpnPacket.HasStreamID || vpnPacket.StreamID == 0 || !vpnPacket.HasSequenceNum {
 		return nil
 	}
-	return response
+	sessionRecord, ok := s.sessions.Active(vpnPacket.SessionID)
+	if !ok {
+		return nil
+	}
+	s.streams.EnsureOpen(vpnPacket.SessionID, vpnPacket.StreamID, time.Now())
+	return s.buildSessionVPNResponse(questionPacket, decision.RequestName, sessionRecord, VpnProto.Packet{
+		PacketType:     Enums.PACKET_STREAM_SYN_ACK,
+		StreamID:       vpnPacket.StreamID,
+		SequenceNum:    vpnPacket.SequenceNum,
+		FragmentID:     0,
+		TotalFragments: 0,
+	})
+}
+
+func (s *Server) handleStreamDataRequest(questionPacket []byte, decision domainmatcher.Decision, vpnPacket VpnProto.Packet) []byte {
+	if !vpnPacket.HasStreamID || vpnPacket.StreamID == 0 || !vpnPacket.HasSequenceNum {
+		return nil
+	}
+	sessionRecord, ok := s.sessions.Active(vpnPacket.SessionID)
+	if !ok {
+		return nil
+	}
+	streamRecord, ok := s.streams.Touch(vpnPacket.SessionID, vpnPacket.StreamID, vpnPacket.SequenceNum, time.Now())
+	if !ok || streamRecord == nil {
+		return s.buildSessionVPNResponse(questionPacket, decision.RequestName, sessionRecord, VpnProto.Packet{
+			PacketType:  Enums.PACKET_STREAM_RST,
+			StreamID:    vpnPacket.StreamID,
+			SequenceNum: 0,
+		})
+	}
+	switch streamRecord.State {
+	case Enums.STREAM_STATE_OPEN, Enums.STREAM_STATE_HALF_CLOSED_REMOTE, Enums.STREAM_STATE_DRAINING, Enums.STREAM_STATE_CLOSING, Enums.STREAM_STATE_TIME_WAIT:
+		return s.buildSessionVPNResponse(questionPacket, decision.RequestName, sessionRecord, VpnProto.Packet{
+			PacketType:  Enums.PACKET_STREAM_DATA_ACK,
+			StreamID:    vpnPacket.StreamID,
+			SequenceNum: vpnPacket.SequenceNum,
+		})
+	default:
+		return s.buildSessionVPNResponse(questionPacket, decision.RequestName, sessionRecord, VpnProto.Packet{
+			PacketType:  Enums.PACKET_STREAM_RST,
+			StreamID:    vpnPacket.StreamID,
+			SequenceNum: 0,
+		})
+	}
+}
+
+func (s *Server) handleStreamFinRequest(questionPacket []byte, decision domainmatcher.Decision, vpnPacket VpnProto.Packet) []byte {
+	if !vpnPacket.HasStreamID || vpnPacket.StreamID == 0 || !vpnPacket.HasSequenceNum {
+		return nil
+	}
+	sessionRecord, ok := s.sessions.Active(vpnPacket.SessionID)
+	if !ok {
+		return nil
+	}
+	if _, ok := s.streams.MarkRemoteFin(vpnPacket.SessionID, vpnPacket.StreamID, vpnPacket.SequenceNum, time.Now()); !ok {
+		return s.buildSessionVPNResponse(questionPacket, decision.RequestName, sessionRecord, VpnProto.Packet{
+			PacketType:  Enums.PACKET_STREAM_RST,
+			StreamID:    vpnPacket.StreamID,
+			SequenceNum: 0,
+		})
+	}
+	return s.buildSessionVPNResponse(questionPacket, decision.RequestName, sessionRecord, VpnProto.Packet{
+		PacketType:  Enums.PACKET_STREAM_FIN_ACK,
+		StreamID:    vpnPacket.StreamID,
+		SequenceNum: vpnPacket.SequenceNum,
+	})
+}
+
+func (s *Server) handleStreamRSTRequest(questionPacket []byte, decision domainmatcher.Decision, vpnPacket VpnProto.Packet) []byte {
+	if !vpnPacket.HasStreamID || vpnPacket.StreamID == 0 || !vpnPacket.HasSequenceNum {
+		return nil
+	}
+	sessionRecord, ok := s.sessions.Active(vpnPacket.SessionID)
+	if !ok {
+		return nil
+	}
+	_ = s.streams.MarkReset(vpnPacket.SessionID, vpnPacket.StreamID, vpnPacket.SequenceNum, time.Now())
+	return s.buildSessionVPNResponse(questionPacket, decision.RequestName, sessionRecord, VpnProto.Packet{
+		PacketType:  Enums.PACKET_STREAM_RST_ACK,
+		StreamID:    vpnPacket.StreamID,
+		SequenceNum: vpnPacket.SequenceNum,
+	})
+}
+
+func (s *Server) handleStreamAckPacket(questionPacket []byte, decision domainmatcher.Decision, vpnPacket VpnProto.Packet) []byte {
+	_ = questionPacket
+	_ = decision
+	if !vpnPacket.HasStreamID || vpnPacket.StreamID == 0 || !vpnPacket.HasSequenceNum {
+		return nil
+	}
+	switch vpnPacket.PacketType {
+	case Enums.PACKET_STREAM_RST_ACK:
+		_ = s.streams.MarkReset(vpnPacket.SessionID, vpnPacket.StreamID, vpnPacket.SequenceNum, time.Now())
+	case Enums.PACKET_STREAM_DATA_ACK, Enums.PACKET_STREAM_FIN_ACK, Enums.PACKET_STREAM_SYN_ACK:
+		_, _ = s.streams.Touch(vpnPacket.SessionID, vpnPacket.StreamID, vpnPacket.SequenceNum, time.Now())
+	}
+	return nil
 }
