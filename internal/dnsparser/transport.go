@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"masterdnsvpn-go/internal/basecodec"
+	"masterdnsvpn-go/internal/compression"
 	Enums "masterdnsvpn-go/internal/enums"
 	VpnProto "masterdnsvpn-go/internal/vpnproto"
 )
@@ -82,7 +83,10 @@ func BuildTXTResponsePacket(questionPacket []byte, answerName string, answerPayl
 
 	header := parseHeader(questionPacket)
 	questionBytes, questionCount := extractQuestionSection(questionPacket, header)
-	optRecords := extractOPTRecordsFromRequest(questionPacket, header, len(questionBytes) > 0 || header.QDCount == 0)
+	optRecords := [][]byte(nil)
+	if len(questionBytes) > 0 || header.QDCount == 0 {
+		optRecords = extractOPTRecordsFromOffset(questionPacket, header, dnsHeaderSize+len(questionBytes))
+	}
 
 	nameBytes, err := encodeDNSNameStrict(answerName)
 	if err != nil {
@@ -144,7 +148,7 @@ func BuildVPNResponsePacket(questionPacket []byte, answerName string, packet Vpn
 		TotalFragments:  packet.TotalFragments,
 		CompressionType: packet.CompressionType,
 		Payload:         packet.Payload,
-	}, 100)
+	}, compression.DefaultMinSize)
 	if err != nil {
 		return nil, err
 	}
@@ -237,20 +241,19 @@ func buildTXTAnswerChunks(rawFrame []byte, baseEncode bool) ([][]byte, error) {
 		return [][]byte{appendLengthPrefixedTXT(nil)}, nil
 	}
 
-	encodeChunk := func(raw []byte) []byte {
-		if !baseEncode {
-			return appendLengthPrefixedTXT(raw)
-		}
-		return appendLengthPrefixedTXT(basecodec.EncodeRawBase64(raw))
-	}
-
 	if len(rawFrame) <= maxChunk {
-		return [][]byte{encodeChunk(rawFrame)}, nil
+		if !baseEncode {
+			return [][]byte{appendLengthPrefixedTXT(rawFrame)}, nil
+		}
+		return [][]byte{appendLengthPrefixedTXT(basecodec.EncodeRawBase64(rawFrame))}, nil
 	}
 
 	header, err := VpnProto.Parse(rawFrame)
 	if err != nil {
-		return [][]byte{encodeChunk(rawFrame)}, nil
+		if !baseEncode {
+			return [][]byte{appendLengthPrefixedTXT(rawFrame)}, nil
+		}
+		return [][]byte{appendLengthPrefixedTXT(basecodec.EncodeRawBase64(rawFrame))}, nil
 	}
 
 	headerLen := header.HeaderLength
@@ -271,11 +274,17 @@ func buildTXTAnswerChunks(rawFrame []byte, baseEncode bool) ([][]byte, error) {
 	}
 
 	chunks := make([][]byte, 0, totalChunks)
-	rawChunk0 := make([]byte, 0, 2+len(rawFrame))
-	rawChunk0 = append(rawChunk0, 0x00, byte(totalChunks))
-	rawChunk0 = append(rawChunk0, rawFrame[:headerLen]...)
-	rawChunk0 = append(rawChunk0, header.Payload[:min(maxChunk0Data, len(header.Payload))]...)
-	chunks = append(chunks, encodeChunk(rawChunk0))
+	chunk0DataLen := min(maxChunk0Data, len(header.Payload))
+	rawChunk0 := make([]byte, 2+headerLen+chunk0DataLen)
+	rawChunk0[0] = 0x00
+	rawChunk0[1] = byte(totalChunks)
+	copy(rawChunk0[2:], rawFrame[:headerLen])
+	copy(rawChunk0[2+headerLen:], header.Payload[:chunk0DataLen])
+	if !baseEncode {
+		chunks = append(chunks, appendLengthPrefixedTXT(rawChunk0))
+	} else {
+		chunks = append(chunks, appendLengthPrefixedTXT(basecodec.EncodeRawBase64(rawChunk0)))
+	}
 
 	cursor := maxChunk0Data
 	for chunkID := 1; cursor < len(header.Payload); chunkID++ {
@@ -286,7 +295,11 @@ func buildTXTAnswerChunks(rawFrame []byte, baseEncode bool) ([][]byte, error) {
 		rawChunk := make([]byte, 1+end-cursor)
 		rawChunk[0] = byte(chunkID)
 		copy(rawChunk[1:], header.Payload[cursor:end])
-		chunks = append(chunks, encodeChunk(rawChunk))
+		if !baseEncode {
+			chunks = append(chunks, appendLengthPrefixedTXT(rawChunk))
+		} else {
+			chunks = append(chunks, appendLengthPrefixedTXT(basecodec.EncodeRawBase64(rawChunk)))
+		}
 		cursor = end
 	}
 
@@ -336,6 +349,9 @@ func extractTXTAnswerPayloads(parsed Packet) [][]byte {
 func extractTXTBytes(rData []byte) []byte {
 	if len(rData) == 0 {
 		return nil
+	}
+	if int(rData[0])+1 == len(rData) {
+		return rData[1:]
 	}
 
 	out := make([]byte, 0, len(rData))

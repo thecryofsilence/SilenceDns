@@ -607,18 +607,22 @@ func (s *Server) handleMTUUpRequest(questionPacket []byte, _ DnsParser.LitePacke
 	if vpnPacket.Payload[0] != mtuProbeModeRaw && vpnPacket.Payload[0] != mtuProbeModeBase64 {
 		return nil
 	}
+
 	probeCode := vpnPacket.Payload[1 : 1+mtuProbeCodeLength]
 	responsePayload := make([]byte, mtuProbeMetaLength)
 	copy(responsePayload, probeCode)
+
 	binary.BigEndian.PutUint16(responsePayload[mtuProbeCodeLength:], uint16(len(vpnPacket.Payload)))
 	response, err := DnsParser.BuildVPNResponsePacket(questionPacket, decision.RequestName, VpnProto.Packet{
 		SessionID:  vpnPacket.SessionID,
 		PacketType: Enums.PACKET_MTU_UP_RES,
 		Payload:    responsePayload,
 	}, baseEncode)
+
 	if err != nil {
 		return nil
 	}
+
 	return response
 }
 
