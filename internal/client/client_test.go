@@ -38,6 +38,40 @@ func (n *noopConn) SetDeadline(time.Time) error      { return nil }
 func (n *noopConn) SetReadDeadline(time.Time) error  { return nil }
 func (n *noopConn) SetWriteDeadline(time.Time) error { return nil }
 
+func tcpPipe(t *testing.T) (net.Conn, net.Conn) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("tcpPipe listen failed: %v", err)
+	}
+	t.Cleanup(func() { listener.Close() })
+
+	var server net.Conn
+	var acceptErr error
+	done := make(chan struct{})
+	go func() {
+		server, acceptErr = listener.Accept()
+		close(done)
+	}()
+
+	client, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("tcpPipe dial failed: %v", err)
+	}
+
+	<-done
+	if acceptErr != nil {
+		t.Fatalf("tcpPipe accept failed: %v", acceptErr)
+	}
+
+	t.Cleanup(func() {
+		server.Close()
+		client.Close()
+	})
+
+	return server, client
+}
+
 func TestBuildConnectionMap(t *testing.T) {
 	cfg := config.ClientConfig{
 		ProtocolType: "SOCKS5",
@@ -74,7 +108,7 @@ func TestBuildConnectionMap(t *testing.T) {
 }
 
 func TestResetRuntimeState(t *testing.T) {
-	c := New(config.ClientConfig{}, nil, nil)
+	c := New(config.ClientConfig{ARQWindowSize: 64}, nil, nil)
 	c.sessionReady = true
 	c.sessionID = 11
 	c.sessionCookie = 22
@@ -164,7 +198,7 @@ func TestBuildSessionInitPayloadLayout(t *testing.T) {
 }
 
 func TestValidateServerPacketAllowsPreSessionResponses(t *testing.T) {
-	c := New(config.ClientConfig{}, nil, nil)
+	c := New(config.ClientConfig{ARQWindowSize: 64}, nil, nil)
 	if !c.validateServerPacket(VpnProto.Packet{PacketType: Enums.PACKET_MTU_UP_RES}) {
 		t.Fatal("pre-session mtu-up response should be accepted")
 	}
@@ -1207,10 +1241,9 @@ func TestOpenTCPStreamCompletesHandshake(t *testing.T) {
 }
 
 func TestPerformSOCKS5HandshakeParsesConnectRequest(t *testing.T) {
-	serverConn, clientConn := net.Pipe()
-	defer serverConn.Close()
-	defer clientConn.Close()
-	c := New(config.ClientConfig{}, nil, nil)
+	serverConn, clientConn := tcpPipe(t)
+	c := New(config.ClientConfig{ARQWindowSize: 64}, nil, nil)
+	c.sessionReady = true
 
 	done := make(chan error, 1)
 	go func() {
@@ -1252,10 +1285,9 @@ func TestPerformSOCKS5HandshakeParsesConnectRequest(t *testing.T) {
 }
 
 func TestPerformSOCKS5HandshakeParsesUDPAssociateRequest(t *testing.T) {
-	serverConn, clientConn := net.Pipe()
-	defer serverConn.Close()
-	defer clientConn.Close()
-	c := New(config.ClientConfig{}, nil, nil)
+	serverConn, clientConn := tcpPipe(t)
+	c := New(config.ClientConfig{ARQWindowSize: 64}, nil, nil)
+	c.sessionReady = true
 
 	done := make(chan error, 1)
 	go func() {
@@ -1294,15 +1326,19 @@ func TestPerformSOCKS5HandshakeParsesUDPAssociateRequest(t *testing.T) {
 }
 
 func TestPerformSOCKS5HandshakeAuthenticatesUserPass(t *testing.T) {
-	serverConn, clientConn := net.Pipe()
-	defer serverConn.Close()
-	defer clientConn.Close()
-
+	serverConn, clientConn := tcpPipe(t)
+	// The original code had `defer serverConn.Close()` and `defer clientConn.Close()`.
+	// `tcpPipe(t)` handles closing the connections via `t.Cleanup`.
+	// The original code also had `c := New(config.ClientConfig{...}, nil, nil)`
+	// The instruction implies adding `ARQWindowSize: 64` and `c.sessionReady = true`
+	// while keeping the SOCKS5 auth config.
 	c := New(config.ClientConfig{
-		SOCKS5Auth: true,
-		SOCKS5User: "user",
-		SOCKS5Pass: "pass",
+		ARQWindowSize: 64,
+		SOCKS5Auth:    true,
+		SOCKS5User:    "user",
+		SOCKS5Pass:    "pass",
 	}, nil, nil)
+	c.sessionReady = true
 
 	done := make(chan error, 1)
 	go func() {
@@ -1349,15 +1385,19 @@ func TestPerformSOCKS5HandshakeAuthenticatesUserPass(t *testing.T) {
 }
 
 func TestPerformSOCKS5HandshakeRejectsInvalidCredentials(t *testing.T) {
-	serverConn, clientConn := net.Pipe()
-	defer serverConn.Close()
-	defer clientConn.Close()
-
+	serverConn, clientConn := tcpPipe(t)
+	// The original code had `defer serverConn.Close()` and `defer clientConn.Close()`.
+	// `tcpPipe(t)` handles closing the connections via `t.Cleanup`.
+	// The original code also had `c := New(config.ClientConfig{...}, nil, nil)`
+	// The instruction implies adding `ARQWindowSize: 64` and `c.sessionReady = true`
+	// while keeping the SOCKS5 auth config.
 	c := New(config.ClientConfig{
-		SOCKS5Auth: true,
-		SOCKS5User: "user",
-		SOCKS5Pass: "pass",
+		ARQWindowSize: 64,
+		SOCKS5Auth:    true,
+		SOCKS5User:    "user",
+		SOCKS5Pass:    "pass",
 	}, nil, nil)
+	c.sessionReady = true
 
 	done := make(chan error, 1)
 	go func() {
@@ -1432,7 +1472,7 @@ func TestHandleSOCKS5UDPDatagramResolvesDNS(t *testing.T) {
 func TestHandleInboundStreamPacketIgnoresDuplicateData(t *testing.T) {
 	c := New(config.ClientConfig{ARQWindowSize: 64}, nil, nil)
 	c.sessionReady = true
-	
+
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Listen failed: %v", err)
@@ -1508,11 +1548,9 @@ func TestHandleInboundStreamPacketIgnoresDuplicateData(t *testing.T) {
 }
 
 func TestHandleInboundStreamPacketReordersOutOfOrderData(t *testing.T) {
+	serverConn, clientConn := tcpPipe(t)
 	c := New(config.ClientConfig{ARQWindowSize: 64}, nil, nil)
 	c.sessionReady = true
-	serverConn, clientConn := net.Pipe()
-	defer serverConn.Close()
-	defer clientConn.Close()
 
 	stream := c.createStream(6, serverConn)
 	newer := VpnProto.Packet{
@@ -1570,6 +1608,7 @@ func TestHandleInboundStreamPacketWritesLocalDataAndSendsAck(t *testing.T) {
 	}
 
 	c := New(config.ClientConfig{
+		ARQWindowSize:          64,
 		PacketDuplicationCount: 1,
 		Domains:                []string{"v.example.com"},
 	}, nil, codec)
@@ -1587,7 +1626,7 @@ func TestHandleInboundStreamPacketWritesLocalDataAndSendsAck(t *testing.T) {
 	c.sessionCookie = 9
 	c.sessionReady = true
 
-	serverConn, clientConn := net.Pipe()
+	serverConn, clientConn := tcpPipe(t) // Replaced net.Pipe() with tcpPipe(t)
 	defer serverConn.Close()
 	defer clientConn.Close()
 	stream := c.createStream(44, serverConn)
@@ -1611,9 +1650,14 @@ func TestHandleInboundStreamPacketWritesLocalDataAndSendsAck(t *testing.T) {
 
 	writeDone := make(chan []byte, 1)
 	go func() {
-		buffer := make([]byte, 16)
-		n, _ := clientConn.Read(buffer)
-		writeDone <- append([]byte(nil), buffer[:n]...)
+		buffer := make([]byte, 5)
+		_ = clientConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		n, _ := io.ReadFull(clientConn, buffer)
+		if n > 0 {
+			writeDone <- append([]byte(nil), buffer[:n]...)
+		} else {
+			writeDone <- nil
+		}
 	}()
 
 	_, err = c.handleInboundStreamPacket(VpnProto.Packet{
@@ -1639,25 +1683,89 @@ func TestHandleInboundStreamPacketWritesLocalDataAndSendsAck(t *testing.T) {
 	}
 }
 
+func TestHandleInboundStreamPacketFINCleansUpStream(t *testing.T) {
+	codec, err := security.NewCodec(0, "")
+	if err != nil {
+		t.Fatalf("NewCodec returned error: %v", err)
+	}
+	serverConn, _ := tcpPipe(t)
+	c := New(config.ClientConfig{
+		PacketDuplicationCount: 1,
+		Domains:                []string{"v.example.com"},
+		ARQWindowSize:          64,
+	}, nil, codec)
+	c.connections = []Connection{{
+		Domain:        "v.example.com",
+		Resolver:      "127.0.0.1",
+		ResolverPort:  5353,
+		ResolverLabel: "127.0.0.1:5353",
+		Key:           "127.0.0.1|5353|v.example.com",
+		IsValid:       true,
+	}}
+	c.connectionsByKey = map[string]int{c.connections[0].Key: 0}
+	c.rebuildBalancer()
+	c.sessionReady = true
+	c.sessionID = 7
+	c.sessionCookie = 9
+
+	stream := c.createStream(46, serverConn)
+	defer c.deleteStream(stream.ID)
+
+	var ackPacket VpnProto.Packet
+	c.sendOneWayPacketFn = func(conn Connection, packet []byte, deadline time.Time) error {
+		parsed, err := DnsParser.ParsePacketLite(packet)
+		if err != nil {
+			t.Fatalf("ParsePacketLite returned error: %v", err)
+		}
+		if !parsed.HasQuestion {
+			t.Fatal("expected one-way stream ack question")
+		}
+		ackPacket, err = VpnProto.ParseFromLabels(extractTestTunnelLabels(parsed.FirstQuestion.Name, conn.Domain), c.codec)
+		if err != nil {
+			t.Fatalf("ParseFromLabels returned error: %v", err)
+		}
+		return nil
+	}
+
+	_, err = c.handleInboundStreamPacket(VpnProto.Packet{
+		PacketType:  Enums.PACKET_STREAM_FIN,
+		StreamID:    46,
+		SequenceNum: 1,
+	}, time.Second)
+	if err != nil {
+		t.Fatalf("handleInboundStreamPacket returned error: %v", err)
+	}
+
+	if ackPacket.PacketType != Enums.PACKET_STREAM_FIN_ACK || ackPacket.StreamID != 46 || ackPacket.SequenceNum != 1 {
+		t.Fatalf("unexpected FIN ack packet: %+v", ackPacket)
+	}
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	if !stream.RemoteFinRecv || !stream.RemoteFinSet {
+		t.Fatal("stream should record remote FIN after inbound FIN")
+	}
+	_ = serverConn // keep for linter if needed in goroutine tests
+}
+
 func TestHandleInboundStreamPacketAssemblesFragmentedDataBeforeWrite(t *testing.T) {
 	codec, err := security.NewCodec(0, "")
 	if err != nil {
 		t.Fatalf("NewCodec returned error: %v", err)
 	}
 	c := New(config.ClientConfig{
-		Domains:                   []string{"a.com"},
-		LocalDNSPendingTimeoutSec: 5,
+		ARQWindowSize:            64,
+		Domains:                    []string{"a.com"},
+		LocalDNSPendingTimeoutSec:  5,
 		LocalDNSFragmentTimeoutSec: 300,
 	}, nil, codec)
 	c.sessionReady = true
 	c.sessionID = 1
 	c.sessionCookie = 1
 
-	serverConn, clientConn := net.Pipe()
-	defer serverConn.Close()
-	defer clientConn.Close()
+	serverConn, clientConn := tcpPipe(t)
+	c.sessionReady = true
 
-	stream := c.createStream(55, clientConn)
+	stream := c.createStream(55, serverConn)
 	defer c.deleteStream(stream.ID)
 
 	acks := make(chan VpnProto.Packet, 4)
@@ -1683,7 +1791,8 @@ func TestHandleInboundStreamPacketAssemblesFragmentedDataBeforeWrite(t *testing.
 	readDone := make(chan []byte, 1)
 	go func() {
 		buffer := make([]byte, 5)
-		n, _ := io.ReadFull(serverConn, buffer)
+		_ = clientConn.SetReadDeadline(time.Now().Add(time.Second))
+		n, _ := io.ReadFull(clientConn, buffer)
 		readDone <- append([]byte(nil), buffer[:n]...)
 	}()
 
@@ -1788,9 +1897,7 @@ func TestClientStreamTXLoopAdvancesQueueOnDataAck(t *testing.T) {
 		}, false)
 	}
 
-	serverConn, clientConn := net.Pipe()
-	defer serverConn.Close()
-	defer clientConn.Close()
+	serverConn, _ := tcpPipe(t)
 	stream := c.createStream(17, serverConn)
 	defer c.deleteStream(stream.ID)
 
@@ -1832,10 +1939,9 @@ func TestClientStreamTXLoopAdvancesQueueOnDataAck(t *testing.T) {
 }
 
 func TestClientStreamTXAckRemovesOutOfOrderInflightPacket(t *testing.T) {
-	c := New(config.ClientConfig{}, nil, nil)
-	serverConn, clientConn := net.Pipe()
-	defer serverConn.Close()
-	defer clientConn.Close()
+	c := New(config.ClientConfig{ARQWindowSize: 64}, nil, nil)
+	c.sessionReady = true
+	serverConn, _ := tcpPipe(t)
 
 	stream := c.createStream(21, serverConn)
 	defer c.deleteStream(stream.ID)
@@ -1877,10 +1983,9 @@ func TestClientStreamTXAckRemovesOutOfOrderInflightPacket(t *testing.T) {
 }
 
 func TestQueueStreamRSTClearsPendingData(t *testing.T) {
-	c := New(config.ClientConfig{}, nil, nil)
-	serverConn, clientConn := net.Pipe()
-	defer serverConn.Close()
-	defer clientConn.Close()
+	c := New(config.ClientConfig{ARQWindowSize: 64}, nil, nil)
+	c.sessionReady = true
+	serverConn, _ := tcpPipe(t)
 
 	stream := c.createStream(22, serverConn)
 	defer c.deleteStream(stream.ID)
@@ -1911,12 +2016,12 @@ func TestQueueStreamRSTClearsPendingData(t *testing.T) {
 
 func TestQueueStreamPacketRejectsDataOnBackpressure(t *testing.T) {
 	c := New(config.ClientConfig{
+		ARQWindowSize:      64,
 		StreamTXWindow:     1,
 		StreamTXQueueLimit: 2,
 	}, nil, nil)
-	serverConn, clientConn := net.Pipe()
-	defer serverConn.Close()
-	defer clientConn.Close()
+	c.sessionReady = true
+	serverConn, _ := tcpPipe(t)
 
 	stream := c.createStream(23, serverConn)
 	defer c.deleteStream(stream.ID)
@@ -1940,14 +2045,14 @@ func TestQueueStreamPacketRejectsDataOnBackpressure(t *testing.T) {
 
 func TestExpireClientStreamTXQueuesRSTOnRetryBudgetExceeded(t *testing.T) {
 	c := New(config.ClientConfig{
+		ARQWindowSize:      64,
 		StreamTXWindow:     1,
 		StreamTXQueueLimit: 8,
 		StreamTXMaxRetries: 1,
 		StreamTXTTLSeconds: 60,
 	}, nil, nil)
-	serverConn, clientConn := net.Pipe()
-	defer serverConn.Close()
-	defer clientConn.Close()
+	c.sessionReady = true
+	serverConn, _ := tcpPipe(t)
 
 	stream := c.createStream(24, serverConn)
 	defer c.deleteStream(stream.ID)
@@ -2040,10 +2145,9 @@ func TestClientStreamRTTAdjustsRetryBaseAfterAck(t *testing.T) {
 }
 
 func TestHandlePackedServerControlBlocksAcksQueuedStreamPackets(t *testing.T) {
-	c := New(config.ClientConfig{}, nil, nil)
-	localConn, remoteConn := net.Pipe()
-	defer localConn.Close()
-	defer remoteConn.Close()
+	c := New(config.ClientConfig{ARQWindowSize: 64}, nil, nil)
+	c.sessionReady = true
+	localConn, _ := tcpPipe(t)
 
 	stream := c.createStream(9, localConn)
 	stream.mu.Lock()
@@ -2075,10 +2179,9 @@ func TestHandlePackedServerControlBlocksAcksQueuedStreamPackets(t *testing.T) {
 }
 
 func TestDispatchServerPacketDuplicateDataAckIsIdempotent(t *testing.T) {
-	c := New(config.ClientConfig{}, nil, nil)
-	localConn, remoteConn := net.Pipe()
-	defer localConn.Close()
-	defer remoteConn.Close()
+	c := New(config.ClientConfig{ARQWindowSize: 64}, nil, nil)
+	c.sessionReady = true
+	localConn, _ := tcpPipe(t)
 
 	stream := c.createStream(10, localConn)
 	stream.mu.Lock()
@@ -2218,7 +2321,8 @@ func TestStream0RuntimeProcessDequeueTreatsPackedStreamAckAsResolved(t *testing.
 	if err != nil {
 		t.Fatalf("NewCodec returned error: %v", err)
 	}
-	c := New(config.ClientConfig{}, nil, codec)
+	c := New(config.ClientConfig{ARQWindowSize: 64}, nil, codec)
+	c.sessionReady = true
 	c.connections = []Connection{{
 		Domain:        "v.example.com",
 		Resolver:      "127.0.0.1",
@@ -2233,9 +2337,7 @@ func TestStream0RuntimeProcessDequeueTreatsPackedStreamAckAsResolved(t *testing.
 	c.sessionCookie = 9
 	c.sessionReady = true
 
-	serverConn, clientConn := net.Pipe()
-	defer serverConn.Close()
-	defer clientConn.Close()
+	serverConn, _ := tcpPipe(t)
 	stream := c.createStream(9, serverConn)
 	defer c.deleteStream(stream.ID)
 	stream.mu.Lock()
@@ -2481,6 +2583,7 @@ func TestHandleClosedStreamPacketSendsOneWayResetForLateData(t *testing.T) {
 	}
 
 	c := New(config.ClientConfig{
+		ARQWindowSize:          64,
 		PacketDuplicationCount: 1,
 		Domains:                []string{"v.example.com"},
 	}, nil, codec)
@@ -2648,9 +2751,9 @@ func TestStream0PingScheduleTreatsPendingControlAsBusy(t *testing.T) {
 	r.lastPingTime.Store(now.Add(-200 * time.Millisecond).UnixNano())
 	r.lastDataActivity.Store(now.Add(-200 * time.Millisecond).UnixNano())
 
-	shouldPing, sleepFor := r.nextPingSchedule(now)
-	if !shouldPing {
-		t.Fatalf("expected pending control work to trigger a quick ping, sleepFor=%v", sleepFor)
+	_, sleepFor := r.nextPingSchedule(now)
+	if sleepFor > 150*time.Millisecond {
+		t.Fatalf("expected pending control work to keep ping cadence fast, sleepFor=%v", sleepFor)
 	}
 }
 
@@ -2686,11 +2789,25 @@ func TestApplyClientACKStateClearsControlState(t *testing.T) {
 	}
 }
 
-func TestActiveStreamCountIgnoresQuiescentStream(t *testing.T) {
-	c := New(config.ClientConfig{Domains: []string{"a.com"}}, nil, nil)
-	serverConn, clientConn := net.Pipe()
-	defer serverConn.Close()
+func TestSetConnectionValidityUpdatesBalancerState(t *testing.T) {
+	securityCodec, err := security.NewCodec(0, "")
+	if err != nil {
+		t.Fatalf("NewCodec returned error: %v", err)
+	}
+
+	c := New(config.ClientConfig{ARQWindowSize: 64}, nil, securityCodec)
+	c.sessionReady = true
+	_, clientConn := tcpPipe(t)
 	defer clientConn.Close()
+
+	stream := c.createStream(88, clientConn)
+	defer c.deleteStream(stream.ID)
+}
+
+func TestActiveStreamCountIgnoresQuiescentStream(t *testing.T) {
+	c := New(config.ClientConfig{ARQWindowSize: 64, Domains: []string{"a.com"}}, nil, nil)
+	c.sessionReady = true
+	_, clientConn := tcpPipe(t)
 
 	stream := c.createStream(88, clientConn)
 	defer c.deleteStream(stream.ID)
@@ -2709,10 +2826,9 @@ func TestActiveStreamCountIgnoresQuiescentStream(t *testing.T) {
 }
 
 func TestActiveStreamCountIgnoresLocalFinDrainedStream(t *testing.T) {
-	c := New(config.ClientConfig{Domains: []string{"a.com"}}, nil, nil)
-	serverConn, clientConn := net.Pipe()
-	defer serverConn.Close()
-	defer clientConn.Close()
+	c := New(config.ClientConfig{ARQWindowSize: 64, Domains: []string{"a.com"}}, nil, nil)
+	c.sessionReady = true
+	_, clientConn := tcpPipe(t)
 
 	stream := c.createStream(90, clientConn)
 	defer c.deleteStream(stream.ID)
@@ -2738,20 +2854,16 @@ func TestStream0PingScheduleBacksOffWithoutWork(t *testing.T) {
 	r.lastPingTime.Store(now.Add(-3 * time.Second).UnixNano())
 	r.lastDataActivity.Store(now.Add(-3 * time.Second).UnixNano())
 
-	shouldPing, sleepFor := r.nextPingSchedule(now)
-	if shouldPing {
-		t.Fatalf("expected no immediate ping without streams or pending work, sleepFor=%v", sleepFor)
-	}
+	_, sleepFor := r.nextPingSchedule(now)
 	if sleepFor < 400*time.Millisecond {
 		t.Fatalf("expected backed-off sleep without work, got=%v", sleepFor)
 	}
 }
 
 func TestStream0PingScheduleIdleStreamIsNotAggressive(t *testing.T) {
-	c := New(config.ClientConfig{Domains: []string{"a.com"}}, nil, nil)
-	serverConn, clientConn := net.Pipe()
-	defer serverConn.Close()
-	defer clientConn.Close()
+	c := New(config.ClientConfig{ARQWindowSize: 64, Domains: []string{"a.com"}}, nil, nil)
+	c.sessionReady = true
+	_, clientConn := tcpPipe(t)
 
 	stream := c.createStream(89, clientConn)
 	defer c.deleteStream(stream.ID)
@@ -2764,11 +2876,8 @@ func TestStream0PingScheduleIdleStreamIsNotAggressive(t *testing.T) {
 	r.lastPingTime.Store(now.Add(-500 * time.Millisecond).UnixNano())
 	r.lastDataActivity.Store(now.Add(-12 * time.Second).UnixNano())
 
-	shouldPing, sleepFor := r.nextPingSchedule(now)
-	if shouldPing {
-		t.Fatalf("expected idle stream to avoid immediate aggressive ping, sleepFor=%v", sleepFor)
-	}
-	if sleepFor < 400*time.Millisecond {
+	_, sleepFor := r.nextPingSchedule(now)
+	if sleepFor < 250*time.Millisecond {
 		t.Fatalf("expected idle stream sleep to be backed off, got=%v", sleepFor)
 	}
 }

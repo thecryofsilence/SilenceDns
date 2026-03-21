@@ -24,6 +24,57 @@ import (
 	VpnProto "masterdnsvpn-go/internal/vpnproto"
 )
 
+func tcpPipe(t *testing.T) (net.Conn, net.Conn) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on tcp: %v", err)
+	}
+
+	done := make(chan net.Conn, 1)
+	errs := make(chan error, 1)
+
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			errs <- err
+			return
+		}
+		done <- conn
+	}()
+
+	clientConn, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		listener.Close()
+		t.Fatalf("failed to dial tcp: %v", err)
+	}
+
+	var serverConn net.Conn
+	select {
+	case serverConn = <-done:
+	case err := <-errs:
+		clientConn.Close()
+		listener.Close()
+		t.Fatalf("failed to accept tcp: %v", err)
+	case <-time.After(2 * time.Second):
+		clientConn.Close()
+		listener.Close()
+		t.Fatal("timed out waiting for tcp accept")
+	}
+
+	listener.Close()
+
+	deadline := time.Now().Add(5 * time.Second)
+	serverConn.SetDeadline(deadline)
+	clientConn.SetDeadline(deadline)
+
+	t.Cleanup(func() {
+		serverConn.Close()
+		clientConn.Close()
+	})
+
+	return serverConn, clientConn
+}
+
 func TestHandlePacketDropsDNSResponses(t *testing.T) {
 	srv := New(config.ServerConfig{
 		MaxPacketSize:     65535,
@@ -342,11 +393,10 @@ func TestHandleStreamSynConnectsForwardTargetForTCPMode(t *testing.T) {
 		MinVPNLabelLength: 3,
 		ForwardIP:         "127.0.0.1",
 		ForwardPort:       8080,
+		ARQWindowSize:     64,
 	}, nil, codec)
 
-	clientSide, serverSide := net.Pipe()
-	defer clientSide.Close()
-	defer serverSide.Close()
+	_, serverSide := tcpPipe(t)
 	srv.dialStreamUpstreamFn = func(network string, address string, timeout time.Duration) (net.Conn, error) {
 		if network != "tcp" || address != "127.0.0.1:8080" {
 			t.Fatalf("unexpected dial target: network=%s address=%s", network, address)
