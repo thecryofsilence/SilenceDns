@@ -40,6 +40,7 @@ func (c *Client) createStream(streamID uint16, conn net.Conn) *clientStream {
 		StopCh:         make(chan struct{}),
 		retryBase:      streamTXInitialRetryDelay,
 		arqWindowSize:  c.arqWindowSize,
+		log:            c.log,
 	}
 	if preferred, ok := c.GetBestConnection(); ok && preferred.Key != "" {
 		stream.PreferredServerKey = preferred.Key
@@ -269,6 +270,13 @@ func (c *Client) handleInboundStreamPacket(packet VpnProto.Packet, timeout time.
 				continue
 			}
 			if _, err := stream.Conn.Write(readyPayload); err != nil {
+				if c.log != nil {
+					c.log.Warnf(
+						"🧦 <yellow>Local Stream Write Failed, Stream ID: <cyan>%d</cyan> | Error: <cyan>%v</cyan></yellow>",
+						stream.ID,
+						err,
+					)
+				}
 				stream.mu.Lock()
 				stream.Closed = true
 				stream.mu.Unlock()
@@ -525,7 +533,7 @@ func (c *Client) runClientStreamTXLoop(stream *clientStream, timeout time.Durati
 				len(packet.Payload),
 			)
 		}
-		if !c.stream0Runtime.QueueStreamPacket(stream.ID, packetType, packet.SequenceNum, packet.Payload) {
+	if !c.stream0Runtime.QueueStreamPacket(stream.ID, packetType, packet.SequenceNum, packet.Payload) {
 			rescheduleClientStreamTX(stream, packet.SequenceNum)
 			time.Sleep(25 * time.Millisecond)
 			continue
@@ -553,6 +561,9 @@ func nextClientStreamTX(stream *clientStream, windowSize int) (*clientStreamTXPa
 		packet.RetryAt = now
 		packet.Scheduled = false
 		stream.TXInFlight = append(stream.TXInFlight, packet)
+		if stream.log != nil {
+			stream.log.Debugf("ðŸ“¤ <blue>TX Move to InFlight, Stream ID: <cyan>%d</cyan> | Seq: <cyan>%d</cyan> | InFlight: <cyan>%d/%d</cyan></blue>", stream.ID, packet.SequenceNum, len(stream.TXInFlight), windowSize)
+		}
 	}
 	if len(stream.TXInFlight) == 0 {
 		return nil, 0, false
@@ -603,6 +614,9 @@ func rescheduleClientStreamTX(stream *clientStream, sequenceNum uint16) {
 			delay = streamTXMaxRetryDelay
 		}
 		stream.TXInFlight[idx].RetryDelay = delay
+		if stream.log != nil {
+			stream.log.Debugf("ðŸ”„ <yellow>TX Rescheduled, Stream ID: <cyan>%d</cyan> | Seq: <cyan>%d</cyan> | Retry: <cyan>%d</cyan></yellow>", stream.ID, sequenceNum, stream.TXInFlight[idx].RetryCount)
+		}
 		return
 	}
 }
@@ -754,12 +768,19 @@ func (c *Client) runLocalStreamReadLoop(stream *clientStream, timeout time.Durat
 		if n > 0 {
 			if c.log != nil {
 				c.log.Debugf(
-					"ðŸ“¤ <blue>Local Stream Read, Stream ID: <cyan>%d</cyan> | Bytes: <cyan>%d</cyan></blue>",
+					"📂 <blue>Local Stream Read, Stream ID: <cyan>%d</cyan> | Bytes: <cyan>%d</cyan></blue>",
 					stream.ID,
 					n,
 				)
 			}
 			if sendErr := c.queueStreamPacket(stream, Enums.PACKET_STREAM_DATA, buffer[:n]); sendErr != nil {
+				if c.log != nil {
+					c.log.Warnf(
+						"📂 <yellow>Local Stream Queue Failed, Stream ID: <cyan>%d</cyan> | Error: <cyan>%v</cyan></yellow>",
+						stream.ID,
+						sendErr,
+					)
+				}
 				_ = c.queueStreamPacket(stream, Enums.PACKET_STREAM_RST, nil)
 				return
 			}

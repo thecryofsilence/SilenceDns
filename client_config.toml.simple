@@ -150,8 +150,3 @@ MTU_USING_SECTION_SEPARATOR_TEXT = "---- Active MTU Testing Results ----"
 # ------------------------------------------------------------------------------
 
 LOG_LEVEL = "INFO"
-
-# ARQ Window Size (Default: 600)
-# This limits the number of out-of-order packets stored in memory.
-ARQ_WINDOW_SIZE = 600
-

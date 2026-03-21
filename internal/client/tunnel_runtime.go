@@ -184,7 +184,7 @@ func (c *Client) sendRuntimeQuery(connection Connection, query []byte, deadline 
 		}
 		return c.handleAsyncServerPacket(packet, timeout)
 	}
-	if c != nil && c.sendOneWayPacketFn != nil {
+	if c.sendOneWayPacketFn != nil {
 		if err := c.sendOneWayPacketFn(connection, query, deadline); err != nil {
 			return err
 		}

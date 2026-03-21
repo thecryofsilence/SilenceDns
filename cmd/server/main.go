@@ -9,6 +9,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"os/signal"
@@ -22,13 +23,22 @@ import (
 )
 
 func main() {
-	cfg, err := config.LoadServerConfig("server_config.toml")
+	configPath := flag.String("config", "server_config.toml", "Path to server configuration file")
+	logPath := flag.String("log", "", "Path to log file (optional)")
+	flag.Parse()
+
+	cfg, err := config.LoadServerConfig(*configPath)
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "Server startup failed: %v\n", err)
 		os.Exit(1)
 	}
 
-	log := logger.New("MasterDnsVPN Server", cfg.LogLevel)
+	var log *logger.Logger
+	if *logPath != "" {
+		log = logger.NewWithFile("MasterDnsVPN Server", cfg.LogLevel, *logPath)
+	} else {
+		log = logger.New("MasterDnsVPN Server", cfg.LogLevel)
+	}
 	log.Infof("\U0001F680 <magenta>MasterDnsVPN Server starting ...</magenta>")
 
 	keyInfo, err := security.EnsureServerEncryptionKey(cfg)

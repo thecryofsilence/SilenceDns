@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"os/signal"
@@ -54,7 +55,11 @@ func startClientListener(wg *sync.WaitGroup, errCh chan<- error, stop context.Ca
 }
 
 func main() {
-	app, err := client.Bootstrap("client_config.toml")
+	configPath := flag.String("config", "client_config.toml", "Path to client configuration file")
+	logPath := flag.String("log", "", "Path to log file (optional)")
+	flag.Parse()
+
+	app, err := client.Bootstrap(*configPath, *logPath)
 	if err != nil {
 		exitWithStderrf("Client startup failed: %v\n", err)
 	}

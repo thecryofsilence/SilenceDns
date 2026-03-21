@@ -31,6 +31,12 @@ type streamOutboundStore struct {
 	queueLimit           int
 }
 
+type outboundSessionStats struct {
+	Pending          int
+	SchedulerPending int
+	Window           int
+}
+
 type outboundNextDetails struct {
 	Packet     VpnProto.Packet
 	HasPacket  bool
@@ -327,6 +333,24 @@ func (s *streamOutboundStore) HasPendingStream(sessionID uint8, streamID uint16)
 		}
 	}
 	return session.scheduler.HasPendingStream(streamID)
+}
+
+func (s *streamOutboundStore) SessionStats(sessionID uint8) outboundSessionStats {
+	if s == nil || sessionID == 0 {
+		return outboundSessionStats{}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	session := s.sessions[sessionID]
+	if session == nil {
+		return outboundSessionStats{Window: s.window}
+	}
+	return outboundSessionStats{
+		Pending:          len(session.pending),
+		SchedulerPending: session.scheduler.Pending(),
+		Window:           s.window,
+	}
 }
 
 func (s *streamOutboundStore) RemoveSession(sessionID uint8) {

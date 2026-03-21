@@ -51,7 +51,13 @@ func (s *Server) dialSOCKSStreamTarget(host string, port uint16, targetPayload [
 	}
 
 	if !s.useExternalSOCKS5 || len(targetPayload) == 0 {
+		if s.log != nil {
+			s.log.Debugf("🧦 <blue>Dialing Upstream TCP</blue> <magenta>|</magenta> <blue>Target</blue>: <cyan>%s:%d</cyan>", host, port)
+		}
 		return s.dialTCPTarget(net.JoinHostPort(host, strconv.Itoa(int(port))))
+	}
+	if s.log != nil {
+		s.log.Debugf("🧦 <blue>Dialing External SOCKS5</blue> <magenta>|</magenta> <blue>Target</blue>: <cyan>%s:%d</cyan>", host, port)
 	}
 	return s.dialExternalSOCKS5Target(targetPayload)
 }

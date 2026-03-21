@@ -1753,7 +1753,7 @@ func TestHandleInboundStreamPacketAssemblesFragmentedDataBeforeWrite(t *testing.
 		t.Fatalf("NewCodec returned error: %v", err)
 	}
 	c := New(config.ClientConfig{
-		ARQWindowSize:            64,
+		ARQWindowSize:              64,
 		Domains:                    []string{"a.com"},
 		LocalDNSPendingTimeoutSec:  5,
 		LocalDNSFragmentTimeoutSec: 300,
@@ -2703,6 +2703,7 @@ func TestAwaitExpectedStreamControlReplyResolvesThroughCentralHarvest(t *testing
 		}, false)
 	}
 
+	c.noteStreamControlSend(Enums.PACKET_STREAM_SYN, 5, 1, time.Now())
 	packet, ok, err := c.awaitExpectedStreamControlReply(Enums.PACKET_STREAM_SYN, 5, 1, time.Now().Add(time.Second))
 	if err != nil {
 		t.Fatalf("awaitExpectedStreamControlReply returned error: %v", err)
@@ -2723,6 +2724,9 @@ func TestStreamControlStateTracksRetryLifecycle(t *testing.T) {
 	if initial.retryDelay != streamControlRetryBaseDelay {
 		t.Fatalf("unexpected initial retry delay: got=%v want=%v", initial.retryDelay, streamControlRetryBaseDelay)
 	}
+	if initial.harvestDelay != streamControlHarvestInterval {
+		t.Fatalf("unexpected initial harvest delay: got=%v want=%v", initial.harvestDelay, streamControlHarvestInterval)
+	}
 	if !c.hasPendingStreamControlWork() {
 		t.Fatal("expected pending control work after creating control state")
 	}
@@ -2734,6 +2738,9 @@ func TestStreamControlStateTracksRetryLifecycle(t *testing.T) {
 	if !updated.retryAt.After(now) {
 		t.Fatal("expected retryAt to move into the future after send")
 	}
+	if !updated.nextHarvestAt.After(now) {
+		t.Fatal("expected nextHarvestAt to move into the future after send")
+	}
 
 	c.clearStreamControlState(Enums.PACKET_STREAM_SYN, 7, 1)
 	if c.hasPendingStreamControlWork() {
@@ -2741,19 +2748,43 @@ func TestStreamControlStateTracksRetryLifecycle(t *testing.T) {
 	}
 }
 
-func TestStream0PingScheduleTreatsPendingControlAsBusy(t *testing.T) {
+func TestStream0PingScheduleDoesNotTreatPendingControlAsBusy(t *testing.T) {
 	c := New(config.ClientConfig{}, nil, nil)
 	now := time.Now()
 	c.noteStreamControlSend(Enums.PACKET_STREAM_SYN, 9, 1, now)
 	defer c.clearStreamControlState(Enums.PACKET_STREAM_SYN, 9, 1)
 
 	r := c.stream0Runtime
-	r.lastPingTime.Store(now.Add(-200 * time.Millisecond).UnixNano())
-	r.lastDataActivity.Store(now.Add(-200 * time.Millisecond).UnixNano())
+	r.lastPingTime.Store(now.Add(-400 * time.Millisecond).UnixNano())
+	r.lastDataActivity.Store(now.Add(-6 * time.Second).UnixNano())
 
 	_, sleepFor := r.nextPingSchedule(now)
-	if sleepFor > 150*time.Millisecond {
-		t.Fatalf("expected pending control work to keep ping cadence fast, sleepFor=%v", sleepFor)
+	if sleepFor < 200*time.Millisecond {
+		t.Fatalf("expected pending control work to avoid aggressive busy cadence, sleepFor=%v", sleepFor)
+	}
+}
+
+func TestDeleteStreamClearsControlTracking(t *testing.T) {
+	c := New(config.ClientConfig{ARQWindowSize: 64, Domains: []string{"a.com"}}, nil, nil)
+	c.sessionReady = true
+	_, clientConn := tcpPipe(t)
+	stream := c.createStream(91, clientConn)
+
+	now := time.Now()
+	c.noteStreamControlSend(Enums.PACKET_STREAM_SYN, stream.ID, 1, now)
+	c.cacheStreamControlReply(VpnProto.Packet{
+		PacketType:  Enums.PACKET_STREAM_SYN_ACK,
+		StreamID:    stream.ID,
+		SequenceNum: 1,
+	})
+
+	c.deleteStream(stream.ID)
+
+	if _, ok := c.streamControlRetryAt(Enums.PACKET_STREAM_SYN, stream.ID, 1); ok {
+		t.Fatal("expected stream control state to be cleared when stream is deleted")
+	}
+	if _, ok := c.takeExpectedStreamControlReply(Enums.PACKET_STREAM_SYN, stream.ID, 1); ok {
+		t.Fatal("expected cached stream control reply to be cleared when stream is deleted")
 	}
 }
 

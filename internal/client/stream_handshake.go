@@ -20,12 +20,14 @@ import (
 var ErrStreamHandshakeFailed = errors.New("stream handshake failed")
 
 const (
-	streamControlRetryBaseDelay = 500 * time.Millisecond
-	streamControlRetryMaxDelay  = 700 * time.Millisecond
-	streamControlPollInterval   = 80 * time.Millisecond
-	streamControlPongSleep      = 20 * time.Millisecond
-	streamControlPongSleepMax   = 120 * time.Millisecond
-	streamControlMaxPolls       = 8
+	streamControlRetryBaseDelay      = 800 * time.Millisecond
+	streamControlRetryMaxDelay       = 2500 * time.Millisecond
+	streamControlHarvestInterval     = 200 * time.Millisecond
+	streamControlInitialHarvestDelay = 120 * time.Millisecond
+	streamControlHarvestTimeout      = 250 * time.Millisecond
+	streamControlPongSleep           = 25 * time.Millisecond
+	streamControlPongSleepMax        = 120 * time.Millisecond
+	streamControlMaxPolls            = 24
 )
 
 func (c *Client) nextStreamID() uint16 {
@@ -225,6 +227,9 @@ func (c *Client) exchangeStreamControlPacket(packetType uint8, streamID uint16, 
 				)
 			}
 			if err := c.sendStreamControlPacketOneWay(packetType, streamID, sequenceNum, payload, connections, remaining); err == nil {
+				if c.log != nil {
+					c.log.Debugf("🧦 <blue>Handshake Packet Sent, Awaiting Reply, Stream ID: <cyan>%d</cyan> | Packet: <cyan>%s</cyan></blue>", streamID, Enums.PacketTypeName(packetType))
+				}
 				packet, ok, waitErr := c.awaitExpectedStreamControlReply(packetType, streamID, sequenceNum, deadline)
 				if waitErr == nil && ok {
 					return packet, nil
@@ -276,36 +281,75 @@ func (c *Client) awaitExpectedStreamControlReply(sentType uint8, streamID uint16
 	if c == nil {
 		return VpnProto.Packet{}, false, ErrStreamHandshakeFailed
 	}
+	pollIdx := 0
 	for {
 		if cachedPacket, ok := c.takeExpectedStreamControlReply(sentType, streamID, sequenceNum); ok {
+			if c.log != nil {
+				c.log.Debugf("🧦 <green>Handshake Reply Found in Cache, Stream ID: <cyan>%d</cyan> | Packet: <cyan>%s</cyan> | Poll: <cyan>%d</cyan></green>", streamID, Enums.PacketTypeName(cachedPacket.PacketType), pollIdx)
+			}
 			return cachedPacket, true, nil
 		}
+		now := time.Now()
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			return VpnProto.Packet{}, false, ErrStreamHandshakeFailed
 		}
-		waitFor := streamControlPollInterval
+		if retryAt, ok := c.streamControlRetryAt(sentType, streamID, sequenceNum); ok && !retryAt.After(now) {
+			return VpnProto.Packet{}, false, nil
+		}
+		if c.log != nil && pollIdx > 0 && pollIdx%8 == 0 {
+			c.log.Warnf(
+				"🧦 <yellow>Handshake Poll Still Waiting, Stream ID: <cyan>%d</cyan> | Waiting For: <cyan>%s</cyan> | Poll: <cyan>%d</cyan> | Remaining: <cyan>%s</cyan></yellow>",
+				streamID,
+				Enums.PacketTypeName(sentType),
+				pollIdx,
+				remaining.Round(time.Millisecond),
+			)
+		}
+		nextWake := remaining
 		if retryAt, ok := c.streamControlRetryAt(sentType, streamID, sequenceNum); ok {
 			retryWait := time.Until(retryAt)
-			if retryWait > 0 && retryWait < waitFor {
-				waitFor = retryWait
+			if retryWait > 0 && retryWait < nextWake {
+				nextWake = retryWait
 			}
 		}
+		if nextHarvestAt, ok := c.streamControlNextHarvestAt(sentType, streamID, sequenceNum); ok && nextHarvestAt.After(now) {
+			harvestWait := nextHarvestAt.Sub(now)
+			if harvestWait > 0 && harvestWait < nextWake {
+				nextWake = harvestWait
+			}
+		}
+		if nextWake > 0 {
+			time.Sleep(nextWake)
+		}
+		if cachedPacket, ok := c.takeExpectedStreamControlReply(sentType, streamID, sequenceNum); ok {
+			if c.log != nil {
+				c.log.Debugf("ðŸ§¦ <green>Handshake Reply Found in Cache, Stream ID: <cyan>%d</cyan> | Packet: <cyan>%s</cyan> | Poll: <cyan>%d</cyan></green>", streamID, Enums.PacketTypeName(cachedPacket.PacketType), pollIdx)
+			}
+			return cachedPacket, true, nil
+		}
+		now = time.Now()
+		if retryAt, ok := c.streamControlRetryAt(sentType, streamID, sequenceNum); ok && !retryAt.After(now) {
+			return VpnProto.Packet{}, false, nil
+		}
+		if nextHarvestAt, ok := c.streamControlNextHarvestAt(sentType, streamID, sequenceNum); ok && nextHarvestAt.After(now) {
+			continue
+		}
+		waitFor := streamControlHarvestTimeout
+		remaining = time.Until(deadline)
 		if waitFor > remaining {
 			waitFor = remaining
 		}
-		if err := c.harvestServerReplies(waitFor); err != nil {
-			return VpnProto.Packet{}, false, err
+		if waitFor <= 0 {
+			return VpnProto.Packet{}, false, ErrStreamHandshakeFailed
 		}
-		harvested := true
-		if harvested {
-			continue
-		}
+		c.noteStreamControlHarvest(sentType, streamID, sequenceNum, now)
 		packet, err := c.sendSessionControlPacket(Enums.PACKET_PING, buildMustClientPingPayload(), nil, waitFor)
 		if err != nil {
 			return VpnProto.Packet{}, false, err
 		}
-		if c.log != nil {
+		pollIdx++
+		if c.log != nil && packet.PacketType != Enums.PACKET_PONG {
 			c.log.Debugf(
 				"🧦 <blue>Stream Control Harvest Reply, Stream ID: <cyan>%d</cyan> | Waiting For: <cyan>%s</cyan> | Got: <cyan>%s</cyan></blue>",
 				streamID,
@@ -314,6 +358,9 @@ func (c *Client) awaitExpectedStreamControlReply(sentType uint8, streamID uint16
 			)
 		}
 		if matchesExpectedStreamResponse(sentType, streamID, sequenceNum, packet) {
+			if c.log != nil {
+				c.log.Debugf("🧦 <green>Handshake Reply Received via PING, Stream ID: <cyan>%d</cyan> | Packet: <cyan>%s</cyan> | Poll: <cyan>%d</cyan></green>", streamID, Enums.PacketTypeName(packet.PacketType), pollIdx)
+			}
 			return packet, true, nil
 		}
 		if err := c.handleAsyncServerPacket(packet, remaining); err != nil {

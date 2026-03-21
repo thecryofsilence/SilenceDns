@@ -9,6 +9,7 @@ package logger
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"strings"
@@ -68,11 +69,24 @@ var coloredLevelTexts = [...]string{
 }
 
 func New(name, rawLevel string) *Logger {
+	return NewWithFile(name, rawLevel, "")
+}
+
+func NewWithFile(name, rawLevel, filePath string) *Logger {
 	appName := "[" + name + "]"
+	var writer io.Writer = os.Stdout
+
+	if filePath != "" {
+		f, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err == nil {
+			writer = io.MultiWriter(os.Stdout, f)
+		}
+	}
+
 	return &Logger{
 		name:           name,
 		level:          parseLevel(rawLevel),
-		base:           log.New(os.Stdout, "", log.LstdFlags),
+		base:           log.New(writer, "", log.LstdFlags),
 		color:          shouldUseColor(),
 		appNameText:    appName,
 		appNameColored: "\x1b[36m" + appName + "\x1b[0m",

@@ -148,6 +148,7 @@ type clientStream struct {
 	RemoteFinRecv        bool
 	ResetSent            bool
 	Closed               bool
+	log                  *logger.Logger
 	LastActivityAt       time.Time
 	InboundDataSeq       uint16
 	InboundDataSet       bool
@@ -200,11 +201,13 @@ type streamControlStateKey struct {
 }
 
 type clientStreamControlState struct {
-	createdAt  time.Time
-	lastSentAt time.Time
-	retryAt    time.Time
-	retryDelay time.Duration
-	retryCount int
+	createdAt     time.Time
+	lastSentAt    time.Time
+	retryAt       time.Time
+	retryDelay    time.Duration
+	nextHarvestAt time.Time
+	harvestDelay  time.Duration
+	retryCount    int
 }
 
 type clientStreamDataFragmentKey struct {
@@ -212,13 +215,19 @@ type clientStreamDataFragmentKey struct {
 	sequenceNum uint16
 }
 
-func Bootstrap(configPath string) (*Client, error) {
+func Bootstrap(configPath string, logPath string) (*Client, error) {
 	cfg, err := config.LoadClientConfig(configPath)
 	if err != nil {
 		return nil, err
 	}
 
-	log := logger.New("MasterDnsVPN Client", cfg.LogLevel)
+	var log *logger.Logger
+	if logPath != "" {
+		log = logger.NewWithFile("MasterDnsVPN Client", cfg.LogLevel, logPath)
+	} else {
+		log = logger.New("MasterDnsVPN Client", cfg.LogLevel)
+	}
+
 	codec, err := security.NewCodec(cfg.DataEncryptionMethod, cfg.EncryptionKey)
 	if err != nil {
 		return nil, fmt.Errorf("client codec setup failed: %w", err)
@@ -684,6 +693,7 @@ func (c *Client) deleteStream(streamID uint16) {
 	delete(c.streams, streamID)
 	c.noteClosedStreamLocked(streamID, time.Now())
 	c.streamsMu.Unlock()
+	c.clearStreamControlTrackingForStream(streamID)
 	c.removeStreamDataFragments(streamID)
 	if stream != nil && stream.Conn != nil {
 		stream.stopOnce.Do(func() {
@@ -702,6 +712,7 @@ func (c *Client) closeAllStreams() {
 	c.streams = make(map[uint16]*clientStream, 16)
 	c.closedStreams = make(map[uint16]int64, 16)
 	c.streamsMu.Unlock()
+	c.clearAllStreamControlTracking()
 	if c.streamDataFragments != nil {
 		c.streamDataFragments = fragmentStore.New[clientStreamDataFragmentKey](64)
 	}
@@ -716,6 +727,40 @@ func (c *Client) closeAllStreams() {
 			_ = stream.Conn.Close()
 		}
 	}
+}
+
+func (c *Client) clearStreamControlTrackingForStream(streamID uint16) {
+	if c == nil || streamID == 0 {
+		return
+	}
+
+	c.streamControlReplyMu.Lock()
+	for key := range c.streamControlReplies {
+		if key.streamID == streamID {
+			delete(c.streamControlReplies, key)
+		}
+	}
+	c.streamControlReplyMu.Unlock()
+
+	c.streamControlStateMu.Lock()
+	for key := range c.streamControlStates {
+		if key.streamID == streamID {
+			delete(c.streamControlStates, key)
+		}
+	}
+	c.streamControlStateMu.Unlock()
+}
+
+func (c *Client) clearAllStreamControlTracking() {
+	if c == nil {
+		return
+	}
+	c.streamControlReplyMu.Lock()
+	c.streamControlReplies = make(map[streamControlReplyKey]cachedStreamControlReply, 16)
+	c.streamControlReplyMu.Unlock()
+	c.streamControlStateMu.Lock()
+	c.streamControlStates = make(map[streamControlStateKey]clientStreamControlState, 8)
+	c.streamControlStateMu.Unlock()
 }
 
 func (c *Client) handleClosedStreamPacket(packet VpnProto.Packet, timeout time.Duration) (VpnProto.Packet, bool, error) {

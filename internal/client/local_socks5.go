@@ -124,6 +124,13 @@ func (c *Client) handleLocalSOCKS5Conn(conn net.Conn) {
 					targetText,
 				)
 			}
+			if c.log != nil {
+				c.log.Debugf(
+					"🧦 <blue>SOCKS5 Stream Attached, Stream ID: <cyan>%d</cyan> | Target: <cyan>%s</cyan></blue>",
+					streamID,
+					targetText,
+				)
+			}
 			attachLocalStreamConn(c, streamID, conn, timeout)
 			return true
 		case 0x03:
