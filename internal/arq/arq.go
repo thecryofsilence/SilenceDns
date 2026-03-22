@@ -256,10 +256,10 @@ func NewARQ(streamID uint16, sessionID uint8, enqueuer PacketEnqueuer, localConn
 		controlMaxRetries:        maxI(5, cfg.ControlMaxRetries),
 		controlPacketTTL:         time.Duration(maxF(120.0, cfg.ControlPacketTTL) * float64(time.Second)),
 
-		isSocks:        cfg.IsSocks,
-		isVirtual:      cfg.IsVirtual,
-		initialData:    cfg.InitialData,
-		socksHandshake: make(chan struct{}),
+		isSocks:         cfg.IsSocks,
+		isVirtual:       cfg.IsVirtual,
+		initialData:     cfg.InitialData,
+		socksHandshake:  make(chan struct{}),
 		compressionType: cfg.CompressionType,
 	}
 
@@ -534,9 +534,9 @@ func (a *ARQ) ioLoop() {
 			a.sndNxt++
 			now := time.Now()
 			a.sndBuf[sn] = &arqDataItem{
-				Data:       append([]byte(nil), chunk...),
-				CreatedAt:  now,
-				LastSentAt: now,
+				Data:            append([]byte(nil), chunk...),
+				CreatedAt:       now,
+				LastSentAt:      now,
 				Retries:         0,
 				CurrentRTO:      a.rto,
 				CompressionType: a.compressionType,
@@ -604,9 +604,9 @@ func (a *ARQ) ioLoop() {
 		a.sndNxt++
 
 		a.sndBuf[sn] = &arqDataItem{
-			Data:       raw,
-			CreatedAt:  time.Now(),
-			LastSentAt: time.Now(),
+			Data:            raw,
+			CreatedAt:       time.Now(),
+			LastSentAt:      time.Now(),
 			Retries:         0,
 			CurrentRTO:      a.rto,
 			CompressionType: a.compressionType,
@@ -1171,7 +1171,6 @@ func (a *ARQ) ForceClose(reason string) {
 		a.Close(reason, false)
 	}
 }
-
 
 // Done returns a channel that is closed when the ARQ context is cancelled or the stream is closed.
 func (a *ARQ) Done() <-chan struct{} {

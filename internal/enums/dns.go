@@ -8,26 +8,35 @@
 package enums
 
 const (
-	PACKET_MTU_UP_REQ                          = 0x01
-	PACKET_MTU_UP_RES                          = 0x02
-	PACKET_MTU_DOWN_REQ                        = 0x03
-	PACKET_MTU_DOWN_RES                        = 0x04
-	PACKET_SESSION_INIT                        = 0x05
-	PACKET_SESSION_ACCEPT                      = 0x06
-	PACKET_PING                                = 0x07
-	PACKET_PONG                                = 0x08
-	PACKET_STREAM_SYN                          = 0x09
-	PACKET_STREAM_SYN_ACK                      = 0x0A
-	PACKET_STREAM_DATA                         = 0x0B
-	PACKET_STREAM_DATA_ACK                     = 0x0C
-	PACKET_STREAM_RESEND                       = 0x0D
-	PACKET_PACKED_CONTROL_BLOCKS               = 0x0E
-	PACKET_STREAM_FIN                          = 0x0F
-	PACKET_STREAM_FIN_ACK                      = 0x10
-	PACKET_STREAM_RST                          = 0x11
-	PACKET_STREAM_RST_ACK                      = 0x12
-	PACKET_SOCKS5_SYN                          = 0x13
-	PACKET_SOCKS5_SYN_ACK                      = 0x14
+	// MTU discovery packets
+	PACKET_MTU_UP_REQ   = 0x01
+	PACKET_MTU_UP_RES   = 0x02
+	PACKET_MTU_DOWN_REQ = 0x03
+	PACKET_MTU_DOWN_RES = 0x04
+
+	// Session management packets
+	PACKET_SESSION_INIT   = 0x05
+	PACKET_SESSION_ACCEPT = 0x06
+	PACKET_PING           = 0x07
+	PACKET_PONG           = 0x08
+
+	// Stream transport packets
+	PACKET_STREAM_SYN            = 0x09
+	PACKET_STREAM_SYN_ACK        = 0x0A
+	PACKET_STREAM_DATA           = 0x0B
+	PACKET_STREAM_DATA_ACK       = 0x0C
+	PACKET_STREAM_RESEND         = 0x0D
+	PACKET_PACKED_CONTROL_BLOCKS = 0x0E
+	PACKET_STREAM_FIN            = 0x0F
+	PACKET_STREAM_FIN_ACK        = 0x10
+	PACKET_STREAM_RST            = 0x11
+	PACKET_STREAM_RST_ACK        = 0x12
+
+	// SOCKS5 stream setup packets
+	PACKET_SOCKS5_SYN     = 0x13
+	PACKET_SOCKS5_SYN_ACK = 0x14
+
+	// SOCKS5 result packets
 	PACKET_SOCKS5_CONNECT_FAIL                 = 0x15
 	PACKET_SOCKS5_CONNECT_FAIL_ACK             = 0x16
 	PACKET_SOCKS5_RULESET_DENIED               = 0x17
@@ -48,15 +57,21 @@ const (
 	PACKET_SOCKS5_AUTH_FAILED_ACK              = 0x26
 	PACKET_SOCKS5_UPSTREAM_UNAVAILABLE         = 0x27
 	PACKET_SOCKS5_UPSTREAM_UNAVAILABLE_ACK     = 0x28
-	PACKET_DNS_QUERY_REQ                       = 0x29
-	PACKET_DNS_QUERY_RES                       = 0x2A
-	PACKET_DNS_QUERY_REQ_ACK                   = 0x2B
-	PACKET_DNS_QUERY_RES_ACK                   = 0x2C
-	PACKET_SESSION_CLOSE                       = 0x2D
-	PACKET_SESSION_BUSY                        = 0x2E
 	PACKET_SOCKS5_CONNECTED                    = 0x2F
 	PACKET_SOCKS5_CONNECTED_ACK                = 0x30
-	PACKET_ERROR_DROP                          = 0xFF
+
+	// DNS tunnel packets
+	PACKET_DNS_QUERY_REQ     = 0x29
+	PACKET_DNS_QUERY_RES     = 0x2A
+	PACKET_DNS_QUERY_REQ_ACK = 0x2B
+	PACKET_DNS_QUERY_RES_ACK = 0x2C
+
+	// Session control packets
+	PACKET_SESSION_CLOSE = 0x2D
+	PACKET_SESSION_BUSY  = 0x2E
+
+	// Generic error packets
+	PACKET_ERROR_DROP = 0xFF
 )
 
 const (

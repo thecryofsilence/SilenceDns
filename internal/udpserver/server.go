@@ -1380,16 +1380,16 @@ func (s *Server) processDeferredSOCKS5Syn(vpnPacket VpnProto.Packet, sessionReco
 		now,
 	)
 
-	// Update legacy state for visibility (removed)
+	// ACK every incoming SOCKS5_SYN fragment immediately, independent of final connect result.
+	_ = s.queueSessionPacket(vpnPacket.SessionID, VpnProto.Packet{
+		PacketType:     Enums.PACKET_SOCKS5_SYN_ACK,
+		StreamID:       vpnPacket.StreamID,
+		SequenceNum:    vpnPacket.SequenceNum,
+		FragmentID:     vpnPacket.FragmentID,
+		TotalFragments: totalFragments,
+	})
 
 	if completed || !ready {
-		_ = s.queueSessionPacket(vpnPacket.SessionID, VpnProto.Packet{
-			PacketType:     Enums.PACKET_SOCKS5_SYN_ACK,
-			StreamID:       vpnPacket.StreamID,
-			SequenceNum:    vpnPacket.SequenceNum,
-			FragmentID:     vpnPacket.FragmentID,
-			TotalFragments: totalFragments,
-		})
 		return
 	}
 
@@ -1420,7 +1420,7 @@ func (s *Server) processDeferredSOCKS5Syn(vpnPacket VpnProto.Packet, sessionReco
 				s.log.Debugf("🧦 <green>SOCKS5_SYN Fast-Ack (Existing), Session: <cyan>%d</cyan> | Stream: <cyan>%d</cyan></green>", vpnPacket.SessionID, vpnPacket.StreamID)
 			}
 			_ = s.queueSessionPacket(vpnPacket.SessionID, VpnProto.Packet{
-				PacketType:  Enums.PACKET_SOCKS5_SYN_ACK,
+				PacketType:  Enums.PACKET_SOCKS5_CONNECTED,
 				StreamID:    vpnPacket.StreamID,
 				SequenceNum: vpnPacket.SequenceNum,
 			})
@@ -1479,7 +1479,7 @@ func (s *Server) processDeferredSOCKS5Syn(vpnPacket VpnProto.Packet, sessionReco
 	}
 
 	_ = s.queueSessionPacket(vpnPacket.SessionID, VpnProto.Packet{
-		PacketType:  Enums.PACKET_SOCKS5_SYN_ACK,
+		PacketType:  Enums.PACKET_SOCKS5_CONNECTED,
 		StreamID:    vpnPacket.StreamID,
 		SequenceNum: vpnPacket.SequenceNum,
 	})
@@ -1507,7 +1507,6 @@ func (s *Server) processDeferredStreamData(vpnPacket VpnProto.Packet, sessionRec
 	stream := record.getOrCreateStream(vpnPacket.StreamID, arq.Config{}, nil, s.log)
 	stream.ARQ.ReceiveData(vpnPacket.SequenceNum, assembledPayload)
 }
-
 
 func (s *Server) handleDNSQueryRequest(decision domainMatcher.Decision, vpnPacket VpnProto.Packet, sessionRecord *sessionRuntimeView) bool {
 	if sessionRecord == nil || vpnPacket.StreamID != 0 || !vpnPacket.HasSequenceNum {

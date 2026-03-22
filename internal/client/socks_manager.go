@@ -353,6 +353,11 @@ func (c *Client) handleSocksUDPAssociate(ctx context.Context, conn net.Conn, cli
 }
 
 func (c *Client) HandleSocksConnected(packet VpnProto.Packet) error {
+	arqObj, err := c.getStreamARQ(packet.StreamID)
+	if err == nil {
+		arqObj.MarkSocksConnected()
+		arqObj.SendControlPacket(Enums.PACKET_SOCKS5_CONNECTED_ACK, packet.SequenceNum, packet.FragmentID, packet.TotalFragments, nil, 0, false, nil)
+	}
 	c.log.Infof("🔌 <green>Socks5 successfully connected for stream %d</green>", packet.StreamID)
 	return nil
 }
