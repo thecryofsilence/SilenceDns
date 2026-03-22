@@ -18,7 +18,7 @@ import (
 
 // Stream_server encapsulates an ARQ instance and its transmit queue for a single stream.
 type Stream_server struct {
-	mu sync.Mutex
+	mu sync.RWMutex
 
 	ID        uint16
 	SessionID uint8
@@ -29,6 +29,11 @@ type Stream_server struct {
 	CreatedAt    time.Time
 	LastActivity time.Time
 	CloseTime    time.Time
+
+	UpstreamConn io.ReadWriteCloser
+	TargetHost   string
+	TargetPort   uint16
+	Connected    bool
 
 	// Tracking for deduplication (similar to Python's _track_stream_packet_once)
 	// Key: packetType << 16 | sequenceNum
@@ -52,7 +57,7 @@ func NewStreamServer(streamID uint16, sessionID uint8, arqConfig arq.Config, loc
 
 // PushTXPacket implements arq.PacketEnqueuer.
 // It adds a packet to the stream's multi-level queue.
-func (s *Stream_server) PushTXPacket(priority int, packetType uint8, sequenceNum uint16, fragmentID uint8, totalFragments uint8, payload []byte) bool {
+func (s *Stream_server) PushTXPacket(priority int, packetType uint8, sequenceNum uint16, fragmentID uint8, totalFragments uint8, compressionType uint8, payload []byte) bool {
 	s.mu.Lock()
 	s.LastActivity = time.Now()
 	s.mu.Unlock()
@@ -67,6 +72,7 @@ func (s *Stream_server) PushTXPacket(priority int, packetType uint8, sequenceNum
 	pkt.SequenceNum = sequenceNum
 	pkt.FragmentID = fragmentID
 	pkt.TotalFragments = totalFragments
+	pkt.CompressionType = compressionType
 	pkt.Payload = payload
 	pkt.CreatedAt = time.Now()
 

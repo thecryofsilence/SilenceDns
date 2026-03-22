@@ -140,6 +140,7 @@ func (c *Client) new_stream(streamID uint16, conn net.Conn, targetPayload []byte
 		ControlPacketTTL:         600.0,
 		FinDrainTimeout:          300.0,
 		GracefulDrainTimeout:     600.0,
+		CompressionType:          c.uploadCompression,
 	}
 
 	a := arq.NewARQ(streamID, c.sessionID, s, conn, mtu, c.log, arqCfg)
@@ -157,7 +158,7 @@ func (c *Client) new_stream(streamID uint16, conn net.Conn, targetPayload []byte
 }
 
 // PushTXPacket adds a packet to the appropriate priority queue if it's not a duplicate.
-func (s *Stream_client) PushTXPacket(priority int, packetType uint8, sequenceNum uint16, fragmentID uint8, totalFragments uint8, payload []byte) bool {
+func (s *Stream_client) PushTXPacket(priority int, packetType uint8, sequenceNum uint16, fragmentID uint8, totalFragments uint8, compressionType uint8, payload []byte) bool {
 	// Generate the tracking key (Policy)
 	key := getTrackingKey(packetType, sequenceNum, fragmentID)
 
@@ -177,6 +178,7 @@ func (s *Stream_client) PushTXPacket(priority int, packetType uint8, sequenceNum
 	p.SequenceNum = sequenceNum
 	p.FragmentID = fragmentID
 	p.TotalFragments = totalFragments
+	p.CompressionType = compressionType
 	p.Payload = payload
 	p.CreatedAt = time.Now()
 	p.RetryCount = 0
@@ -302,6 +304,7 @@ func (c *Client) InitVirtualStream0() {
 		ControlPacketTTL:         999999.0,
 		FinDrainTimeout:          300.0,
 		GracefulDrainTimeout:     600.0,
+		CompressionType:          c.uploadCompression,
 	}
 
 	conn := &fakeConn{}

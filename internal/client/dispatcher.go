@@ -84,57 +84,45 @@ func (c *Client) asyncStreamDispatcher(ctx context.Context) {
 
 		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 
-		highestPrio := -1
-		for _, id := range ids {
-			c.streamsMu.RLock()
-			s := c.active_streams[id]
-			c.streamsMu.RUnlock()
-			if s == nil || s.txQueue == nil {
-				continue
-			}
-			p := s.txQueue.HighestPriority()
-			if p != -1 {
-				if highestPrio == -1 || p < highestPrio {
-					highestPrio = p
-				}
-			}
-		}
-
-		if highestPrio == -1 {
-			continue
-		}
-
-		// Find candidates having this highest priority
-		var candidates []*Stream_client
-		for _, id := range ids {
-			c.streamsMu.RLock()
-			s := c.active_streams[id]
-			c.streamsMu.RUnlock()
-			if s != nil && s.txQueue != nil && s.txQueue.HighestPriority() == highestPrio {
-				candidates = append(candidates, s)
-			}
-		}
-
-		if len(candidates) == 0 {
-			continue
-		}
-
-		// Fair Round-Robin Pick
+		// Find the next stream to serve using fair Round-Robin across all active streams.
 		var selected *Stream_client
-		for _, s := range candidates {
-			if s.StreamID >= rrCursor {
-				selected = s
+		var item *clientStreamTXPacket
+		var ok bool
+
+		// Start search from rrCursor
+		startIndex := -1
+		for i, id := range ids {
+			if id >= rrCursor {
+				startIndex = i
 				break
 			}
 		}
-		if selected == nil {
-			selected = candidates[0] // Wrap around
+		if startIndex == -1 {
+			startIndex = 0
 		}
 
-		rrCursor = selected.StreamID + 1
+		for i := 0; i < len(ids); i++ {
+			idx := (startIndex + i) % len(ids)
+			id := ids[idx]
 
-		item, _, ok := selected.PopNextTXPacket()
-		if !ok || item == nil {
+			c.streamsMu.RLock()
+			s := c.active_streams[id]
+			c.streamsMu.RUnlock()
+
+			if s == nil || s.txQueue == nil {
+				continue
+			}
+
+			// PopNextTXPacket returns the highest priority packet available for this stream.
+			item, _, ok = s.PopNextTXPacket()
+			if ok && item != nil {
+				selected = s
+				rrCursor = id + 1
+				break
+			}
+		}
+
+		if selected == nil || item == nil {
 			continue
 		}
 

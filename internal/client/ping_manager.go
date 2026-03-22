@@ -172,7 +172,7 @@ func (p *PingManager) pingLoop() {
 					p.client.streamsMu.RUnlock()
 
 					if s0 != nil {
-						s0.PushTXPacket(5, Enums.PACKET_PING, 0, 0, 0, payload)
+						s0.PushTXPacket(5, Enums.PACKET_PING, 0, 0, 0, 0, payload)
 					}
 				}
 			}

@@ -34,7 +34,7 @@ const (
 
 // PacketEnqueuer abstracts the transmission layer (Client or Server stream)
 type PacketEnqueuer interface {
-	PushTXPacket(priority int, packetType uint8, sequenceNum uint16, fragmentID uint8, totalFragments uint8, payload []byte) bool
+	PushTXPacket(priority int, packetType uint8, sequenceNum uint16, fragmentID uint8, totalFragments uint8, compressionType uint8, payload []byte) bool
 }
 
 type Logger interface {
@@ -50,11 +50,12 @@ func (d *dummyLogger) Infof(f string, a ...any)  {}
 func (d *dummyLogger) Errorf(f string, a ...any) {}
 
 type arqDataItem struct {
-	Data       []byte
-	CreatedAt  time.Time
-	LastSentAt time.Time
-	Retries    int
-	CurrentRTO time.Duration
+	Data            []byte
+	CreatedAt       time.Time
+	LastSentAt      time.Time
+	Retries         int
+	CurrentRTO      time.Duration
+	CompressionType uint8
 }
 
 type arqControlItem struct {
@@ -115,7 +116,8 @@ type ARQ struct {
 	localConn io.ReadWriteCloser
 	logger    Logger
 
-	mtu int
+	mtu             int
+	compressionType uint8
 
 	// Sequence and buffers
 	sndNxt        uint16
@@ -202,6 +204,13 @@ type Config struct {
 	ControlPacketTTL         float64
 	FinDrainTimeout          float64
 	GracefulDrainTimeout     float64
+	CompressionType          uint8
+}
+
+func (a *ARQ) IsClosed() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.closed
 }
 
 // NewARQ instantiates a pristine reliable streaming overlay suitable for client or server
@@ -251,6 +260,7 @@ func NewARQ(streamID uint16, sessionID uint8, enqueuer PacketEnqueuer, localConn
 		isVirtual:      cfg.IsVirtual,
 		initialData:    cfg.InitialData,
 		socksHandshake: make(chan struct{}),
+		compressionType: cfg.CompressionType,
 	}
 
 	// Apply Event unblock state
@@ -274,9 +284,33 @@ func NewARQ(streamID uint16, sessionID uint8, enqueuer PacketEnqueuer, localConn
 
 // Start launches the core background loops for IO multiplexing and retransmission
 func (a *ARQ) Start() {
-	a.wg.Add(2)
-	go a.ioLoop()
+	a.wg.Add(1)
 	go a.retransmitLoop()
+
+	a.mu.Lock()
+	hasConn := a.localConn != nil
+	a.mu.Unlock()
+
+	if hasConn {
+		a.wg.Add(1)
+		go a.ioLoop()
+	}
+}
+
+func (a *ARQ) SetLocalConn(conn io.ReadWriteCloser) {
+	a.mu.Lock()
+	if a.localConn != nil {
+		a.mu.Unlock()
+		return
+	}
+	a.localConn = conn
+	a.mu.Unlock()
+
+	// Start ioLoop if ARQ is already running (ctx is not nil)
+	if a.ctx != nil && a.ctx.Err() == nil {
+		a.wg.Add(1)
+		go a.ioLoop()
+	}
 }
 
 func minF(x, y float64) float64 {
@@ -503,11 +537,12 @@ func (a *ARQ) ioLoop() {
 				Data:       append([]byte(nil), chunk...),
 				CreatedAt:  now,
 				LastSentAt: now,
-				Retries:    0,
-				CurrentRTO: a.rto,
+				Retries:         0,
+				CurrentRTO:      a.rto,
+				CompressionType: a.compressionType,
 			}
 			a.mu.Unlock()
-			a.enqueuer.PushTXPacket(3, Enums.PACKET_STREAM_DATA, sn, 0, 0, chunk)
+			a.enqueuer.PushTXPacket(3, Enums.PACKET_STREAM_DATA, sn, 0, 0, a.compressionType, chunk)
 			offset += a.mtu
 		}
 	}
@@ -572,8 +607,9 @@ func (a *ARQ) ioLoop() {
 			Data:       raw,
 			CreatedAt:  time.Now(),
 			LastSentAt: time.Now(),
-			Retries:    0,
-			CurrentRTO: a.rto,
+			Retries:         0,
+			CurrentRTO:      a.rto,
+			CompressionType: a.compressionType,
 		}
 
 		if len(a.sndBuf) >= a.limit {
@@ -581,7 +617,7 @@ func (a *ARQ) ioLoop() {
 		}
 		a.mu.Unlock()
 
-		a.enqueuer.PushTXPacket(3, Enums.PACKET_STREAM_DATA, sn, 0, 0, raw)
+		a.enqueuer.PushTXPacket(3, Enums.PACKET_STREAM_DATA, sn, 0, 0, a.compressionType, raw)
 	}
 
 	// Closure Handling Strategy
@@ -808,7 +844,7 @@ func (a *ARQ) ReceiveData(sn uint16, data []byte) {
 		a.mu.Unlock()
 
 		if emit {
-			a.enqueuer.PushTXPacket(0, Enums.PACKET_STREAM_DATA_ACK, sn, 0, 0, nil)
+			a.enqueuer.PushTXPacket(0, Enums.PACKET_STREAM_DATA_ACK, sn, 0, 0, 0, nil)
 		}
 		return
 	}
@@ -830,7 +866,7 @@ func (a *ARQ) ReceiveData(sn uint16, data []byte) {
 	a.mu.Unlock()
 
 	a.flushReadyLocalData()
-	a.enqueuer.PushTXPacket(0, Enums.PACKET_STREAM_DATA_ACK, sn, 0, 0, nil)
+	a.enqueuer.PushTXPacket(0, Enums.PACKET_STREAM_DATA_ACK, sn, 0, 0, 0, nil)
 	a.tryFinalizeRemoteEOF()
 }
 
@@ -854,7 +890,7 @@ func (a *ARQ) ReceiveAck(sn uint16) {
 
 func (a *ARQ) SendControlPacket(packetType uint8, sequenceNum uint16, fragmentID uint8, totalFragments uint8, payload []byte, priority int, trackForAck bool, customAckType *uint8) bool {
 	copyData := append([]byte(nil), payload...)
-	ok := a.enqueuer.PushTXPacket(priority, packetType, sequenceNum, fragmentID, totalFragments, copyData)
+	ok := a.enqueuer.PushTXPacket(priority, packetType, sequenceNum, fragmentID, totalFragments, 0, copyData)
 	if !ok {
 		return false
 	}
@@ -976,8 +1012,9 @@ func (a *ARQ) checkRetransmits() {
 	}
 
 	type rtxJob struct {
-		sn   uint16
-		data []byte
+		sn              uint16
+		data            []byte
+		compressionType uint8
 	}
 	var jobs []rtxJob
 
@@ -989,7 +1026,7 @@ func (a *ARQ) checkRetransmits() {
 		}
 
 		if now.Sub(info.LastSentAt) >= info.CurrentRTO {
-			jobs = append(jobs, rtxJob{sn, info.Data})
+			jobs = append(jobs, rtxJob{sn, info.Data, info.CompressionType})
 			info.LastSentAt = now
 			info.Retries++
 
@@ -1000,7 +1037,7 @@ func (a *ARQ) checkRetransmits() {
 	a.mu.Unlock()
 
 	for _, j := range jobs {
-		a.enqueuer.PushTXPacket(1, Enums.PACKET_STREAM_RESEND, j.sn, 0, 0, j.data)
+		a.enqueuer.PushTXPacket(1, Enums.PACKET_STREAM_RESEND, j.sn, 0, 0, j.compressionType, j.data)
 	}
 
 	if a.enableControlReliability {
@@ -1034,7 +1071,7 @@ func (a *ARQ) checkControlRetransmits(now time.Time) {
 			continue
 		}
 
-		ok := a.enqueuer.PushTXPacket(info.Priority, info.PacketType, info.SequenceNum, info.FragmentID, info.TotalFragments, info.Payload)
+		ok := a.enqueuer.PushTXPacket(info.Priority, info.PacketType, info.SequenceNum, info.FragmentID, info.TotalFragments, 0, info.Payload)
 		if !ok {
 			delete(a.controlSndBuf, key)
 			continue

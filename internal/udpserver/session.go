@@ -18,7 +18,6 @@ import (
 
 	"masterdnsvpn-go/internal/arq"
 	Enums "masterdnsvpn-go/internal/enums"
-	"masterdnsvpn-go/internal/mlq"
 	VpnProto "masterdnsvpn-go/internal/vpnproto"
 )
 
@@ -29,8 +28,10 @@ const (
 	maxServerSessionSlots = 255
 	sessionInitTTL        = 10 * time.Minute
 	sessionInitDataSize   = 10
-	minSessionMTU         = 30
-	maxSessionMTU         = 4096
+	minSessionMTU               = 30
+	maxSessionMTU               = 4096
+	serverClosedStreamRecordTTL = 45 * time.Second
+	serverClosedStreamRecordCap = 1000
 )
 
 type QueueTarget uint8
@@ -61,22 +62,23 @@ type sessionRecord struct {
 	lastActivityUnixNano int64
 
 	// New fields for ARQ refactor
-	MainQueue     *mlq.MultiLevelQueue[*serverStreamTXPacket]
 	Streams       map[uint16]*Stream_server
 	ActiveStreams []uint16 // Sorted list of active stream IDs for Round-Robin
 	RRStreamID    uint16   // Last served stream ID for RR
 	EnqueueSeq    uint64   // Global sequence for FIFO inside same priority
-	StreamsMu     sync.RWMutex
+	StreamsMu      sync.RWMutex
+	RecentlyClosed map[uint16]time.Time
 }
 
 // serverStreamTXPacket represents a queued packet pending transmission or retransmission.
 type serverStreamTXPacket struct {
-	PacketType     uint8
-	SequenceNum    uint16
-	FragmentID     uint8
-	TotalFragments uint8
-	Payload        []byte
-	CreatedAt      time.Time
+	PacketType      uint8
+	SequenceNum     uint16
+	FragmentID      uint8
+	TotalFragments  uint8
+	CompressionType uint8
+	Payload         []byte
+	CreatedAt       time.Time
 }
 
 var txPacketPool = sync.Pool{
@@ -125,7 +127,6 @@ type sessionRuntimeView struct {
 	DownloadMTU          uint16
 	DownloadMTUBytes     int
 	MaxPackedBlocks      int
-	StreamReadBufferSize int
 }
 
 type sessionSnapshot struct {
@@ -140,7 +141,6 @@ type sessionSnapshot struct {
 	VerifyCode           [4]byte
 	Signature            [sessionInitDataSize]byte
 	MaxPackedBlocks      int
-	StreamReadBufferSize int
 	CreatedAt            time.Time
 	LastActivityAt       time.Time
 	ReuseUntil           time.Time
@@ -230,10 +230,12 @@ func (s *sessionStore) findOrCreate(payload []byte, uploadCompressionType uint8,
 		CreatedAt:     now,
 		ReuseUntil:    now.Add(sessionInitTTL),
 		Signature:     signature,
-		MainQueue:     mlq.New[*serverStreamTXPacket](32),
-		Streams:       make(map[uint16]*Stream_server),
-		ActiveStreams: make([]uint16, 0, 8),
+		Streams:        make(map[uint16]*Stream_server),
+		ActiveStreams:  make([]uint16, 0, 8),
+		RecentlyClosed: make(map[uint16]time.Time, 8),
 	}
+	// Initialize virtual Stream 0 for control packets
+	record.ensureStream0(nil) // Caller should update logger if needed
 	record.reuseUntilUnixNano = record.ReuseUntil.UnixNano()
 	record.setLastActivityUnixNano(nowUnixNano)
 	record.UploadCompression = uploadCompressionType
@@ -276,6 +278,16 @@ func (s *sessionStore) expireReuseLocked(nowUnixNano int64) {
 		}
 	}
 	s.nextReuseSweepUnixNano = nextReuseSweepUnixNano
+}
+
+func (s *sessionStore) Get(sessionID uint8) (*sessionRecord, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record := s.byID[sessionID]
+	if record == nil {
+		return nil, false
+	}
+	return record, true
 }
 
 func (s *sessionStore) Touch(sessionID uint8, now time.Time) bool {
@@ -537,7 +549,6 @@ func (r *sessionRecord) applyMTUFromSessionInit(uploadMTU uint16, downloadMTU ui
 	r.DownloadMTU = clampMTU(downloadMTU)
 	r.DownloadMTUBytes = int(r.DownloadMTU)
 	r.MaxPackedBlocks = VpnProto.CalculateMaxPackedBlocks(r.DownloadMTUBytes, 80, 0)
-	r.StreamReadBufferSize = computeStreamReadBufferSize(r.DownloadMTUBytes)
 }
 
 func (r *sessionRecord) runtimeView() sessionRuntimeView {
@@ -550,7 +561,6 @@ func (r *sessionRecord) runtimeView() sessionRuntimeView {
 		DownloadMTU:          r.DownloadMTU,
 		DownloadMTUBytes:     r.DownloadMTUBytes,
 		MaxPackedBlocks:      r.MaxPackedBlocks,
-		StreamReadBufferSize: r.StreamReadBufferSize,
 	}
 }
 
@@ -573,7 +583,6 @@ func (r *sessionRecord) snapshot() sessionSnapshot {
 		VerifyCode:           r.VerifyCode,
 		Signature:            r.Signature,
 		MaxPackedBlocks:      r.MaxPackedBlocks,
-		StreamReadBufferSize: r.StreamReadBufferSize,
 		CreatedAt:            r.CreatedAt,
 		LastActivityAt:       lastActivityAt,
 		ReuseUntil:           r.ReuseUntil,
@@ -623,4 +632,67 @@ func (r *sessionRecord) getOrCreateStream(streamID uint16, arqConfig arq.Config,
 	}
 
 	return s
+}
+func (r *sessionRecord) noteStreamClosed(streamID uint16, now time.Time) {
+	if streamID == 0 {
+		return
+	}
+	r.StreamsMu.Lock()
+	defer r.StreamsMu.Unlock()
+
+	// Cleanup old records
+	expiredBefore := now.Add(-serverClosedStreamRecordTTL)
+	for id, closedAt := range r.RecentlyClosed {
+		if closedAt.Before(expiredBefore) {
+			delete(r.RecentlyClosed, id)
+		}
+	}
+
+	r.RecentlyClosed[streamID] = now
+
+	// Cap the map size
+	if len(r.RecentlyClosed) > serverClosedStreamRecordCap {
+		var oldestID uint16
+		var oldestAt time.Time
+		first := true
+		for id, closedAt := range r.RecentlyClosed {
+			if first || closedAt.Before(oldestAt) {
+				oldestID = id
+				oldestAt = closedAt
+				first = false
+			}
+		}
+		delete(r.RecentlyClosed, oldestID)
+	}
+}
+
+func (r *sessionRecord) isRecentlyClosed(streamID uint16, now time.Time) bool {
+	r.StreamsMu.RLock()
+	defer r.StreamsMu.RUnlock()
+
+	closedAt, ok := r.RecentlyClosed[streamID]
+	if !ok {
+		return false
+	}
+
+	return now.Sub(closedAt) <= serverClosedStreamRecordTTL
+}
+
+func (r *sessionRecord) removeStream(streamID uint16, now time.Time) {
+	if streamID == 0 {
+		return
+	}
+	r.StreamsMu.Lock()
+	delete(r.Streams, streamID)
+
+	// Remove from ActiveStreams
+	for i, id := range r.ActiveStreams {
+		if id == streamID {
+			r.ActiveStreams = append(r.ActiveStreams[:i], r.ActiveStreams[i+1:]...)
+			break
+		}
+	}
+	r.StreamsMu.Unlock()
+
+	r.noteStreamClosed(streamID, now)
 }

@@ -197,17 +197,18 @@ func (c *Client) getStreamARQ(streamID uint16) (*arq.ARQ, error) {
 
 // clientStreamTXPacket represents a queued packet pending transmission or retransmission.
 type clientStreamTXPacket struct {
-	PacketType     uint8
-	SequenceNum    uint16
-	FragmentID     uint8
-	TotalFragments uint8
-	Payload        []byte
-	CreatedAt      time.Time
-	LastSentAt     time.Time
-	RetryDelay     time.Duration
-	RetryAt        time.Time
-	RetryCount     int
-	Scheduled      bool
+	PacketType      uint8
+	SequenceNum     uint16
+	FragmentID      uint8
+	TotalFragments  uint8
+	CompressionType uint8
+	Payload         []byte
+	CreatedAt       time.Time
+	LastSentAt      time.Time
+	RetryDelay      time.Duration
+	RetryAt         time.Time
+	RetryCount      int
+	Scheduled       bool
 }
 
 // Connection represents a unique domain-resolver pair with its associated metadata and MTU states.

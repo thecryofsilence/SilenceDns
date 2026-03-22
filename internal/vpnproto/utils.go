@@ -19,10 +19,9 @@ func CalculateMaxPackedBlocks(mtu int, percent int, absoluteMax int) int {
 		percent = 50 // Default to 50% if invalid percent provided
 	}
 
-	const blockSize = 7
 	effectiveSize := (mtu * percent) / 100
 
-	count := effectiveSize / blockSize
+	count := effectiveSize / PackedControlBlockSize
 	if count < 1 {
 		count = 1
 	}
