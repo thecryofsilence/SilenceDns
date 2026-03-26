@@ -118,6 +118,66 @@ func (c *errAfterDataConn) Close() error {
 	return nil
 }
 
+type timeoutOnlyError struct{}
+
+func (e timeoutOnlyError) Error() string   { return "timeout" }
+func (e timeoutOnlyError) Timeout() bool   { return true }
+func (e timeoutOnlyError) Temporary() bool { return false }
+
+func newTransientOpError(op string) error {
+	return &net.OpError{Op: op, Net: "tcp", Err: errors.New("transient op failure")}
+}
+
+type transientReadConn struct {
+	mu       sync.Mutex
+	closed   bool
+}
+
+func (c *transientReadConn) Read(_ []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return 0, newTransientOpError("read")
+}
+
+func (c *transientReadConn) Write(p []byte) (int, error) { return len(p), nil }
+func (c *transientReadConn) Close() error {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	return nil
+}
+
+type transientWriteConn struct {
+	mu          sync.Mutex
+	failWrites  int
+	writes      [][]byte
+	closed      bool
+	readBlocked bool
+}
+
+func (c *transientWriteConn) Read(_ []byte) (int, error) {
+	time.Sleep(50 * time.Millisecond)
+	return 0, timeoutOnlyError{}
+}
+
+func (c *transientWriteConn) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.failWrites > 0 {
+		c.failWrites--
+		return 0, newTransientOpError("write")
+	}
+	c.writes = append(c.writes, append([]byte(nil), p...))
+	return len(p), nil
+}
+
+func (c *transientWriteConn) Close() error {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	return nil
+}
+
 func TestARQ_New(t *testing.T) {
 	enqueuer := NewMockPacketEnqueuer()
 	cfg := Config{
@@ -606,12 +666,106 @@ func TestARQ_IOReadDataWithErrorDefersRSTUntilDrain(t *testing.T) {
 	default:
 	}
 
-	a.mu.Lock()
-	deferred := a.deferredClose
-	deferredPacket := a.deferredPacket
-	a.mu.Unlock()
-	if !deferred || deferredPacket != Enums.PACKET_STREAM_RST {
-		t.Fatal("expected read error after data to arm deferred RST drain path")
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		a.mu.Lock()
+		deferred := a.deferredClose
+		deferredPacket := a.deferredPacket
+		a.mu.Unlock()
+		if deferred && deferredPacket == Enums.PACKET_STREAM_RST {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("expected read error after data to arm deferred RST drain path")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestARQ_IOTransientReadErrorDoesNotResetStream(t *testing.T) {
+	enqueuer := NewMockPacketEnqueuer()
+	cfg := Config{
+		WindowSize: 100,
+		RTO:        0.1,
+		MaxRTO:     0.5,
+	}
+
+	conn := &transientReadConn{}
+	a := NewARQ(1, 1, enqueuer, conn, 1000, &testLogger{t}, cfg)
+	a.Start()
+	defer a.Close("test end", CloseOptions{Force: true})
+
+	time.Sleep(150 * time.Millisecond)
+
+	if a.IsClosed() {
+		t.Fatal("expected transient read error not to close stream")
+	}
+	if a.IsReset() {
+		t.Fatal("expected transient read error not to move stream to reset path")
+	}
+}
+
+func TestARQ_IOTransientReadErrorEventuallyStopsRetrying(t *testing.T) {
+	enqueuer := NewMockPacketEnqueuer()
+	cfg := Config{
+		WindowSize: 100,
+		RTO:        0.1,
+		MaxRTO:     0.5,
+	}
+
+	conn := &transientReadConn{}
+	a := NewARQ(1, 1, enqueuer, conn, 1000, &testLogger{t}, cfg)
+	a.Start()
+	defer a.Close("test end", CloseOptions{Force: true})
+
+	select {
+	case <-a.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected repeated transient read errors to eventually stop the stream")
+	}
+}
+
+func TestARQ_WriteLoopRetriesTransientWriteError(t *testing.T) {
+	enqueuer := NewMockPacketEnqueuer()
+	cfg := Config{
+		WindowSize: 100,
+		RTO:        0.1,
+		MaxRTO:     0.5,
+	}
+
+	conn := &transientWriteConn{failWrites: 1}
+	a := NewARQ(1, 1, enqueuer, conn, 1000, &testLogger{t}, cfg)
+	a.Start()
+	defer a.Close("test end", CloseOptions{Force: true})
+
+	a.ReceiveData(0, []byte("from peer"))
+
+	timeout := time.After(1 * time.Second)
+	for {
+		conn.mu.Lock()
+		writes := len(conn.writes)
+		payload := []byte(nil)
+		if writes > 0 {
+			payload = append([]byte(nil), conn.writes[0]...)
+		}
+		conn.mu.Unlock()
+		if writes > 0 {
+			if !bytes.Equal(payload, []byte("from peer")) {
+				t.Fatalf("expected write payload %q, got %q", []byte("from peer"), payload)
+			}
+			break
+		}
+
+		select {
+		case <-timeout:
+			t.Fatal("timed out waiting for transient write retry to succeed")
+		default:
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+
+	if a.IsClosed() {
+		t.Fatal("expected transient write error not to close stream")
 	}
 }
 

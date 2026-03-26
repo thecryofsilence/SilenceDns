@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"sync"
 	"time"
 
@@ -172,6 +173,45 @@ type ARQ struct {
 
 type closeWriter interface {
 	CloseWrite() error
+}
+
+type ioErrorClass int
+
+const (
+	ioErrorFatal ioErrorClass = iota
+	ioErrorTimeout
+	ioErrorEOF
+	ioErrorClosed
+	ioErrorTransient
+)
+
+const (
+	ioRetryBackoff         = 100 * time.Millisecond
+	ioTransientReadBudget  = 3 * time.Second
+	ioTransientWriteBudget = 3
+)
+
+func classifyIOError(err error) ioErrorClass {
+	if err == nil {
+		return ioErrorFatal
+	}
+	if errors.Is(err, io.EOF) {
+		return ioErrorEOF
+	}
+	if errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) {
+		return ioErrorClosed
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() {
+			return ioErrorTimeout
+		}
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return ioErrorTransient
+	}
+	return ioErrorFatal
 }
 
 // Config represents the extensive ARQ tuning configuration identically ported from Python
@@ -585,6 +625,7 @@ func (a *ARQ) ioLoop() {
 	gracefulEOF := false
 	alreadyHandled := false
 	var errorReason string
+	var transientReadSince time.Time
 
 	buf := make([]byte, a.mtu)
 
@@ -622,6 +663,7 @@ func (a *ARQ) ioLoop() {
 
 		n, err := a.localConn.Read(buf)
 		if n > 0 {
+			transientReadSince = time.Time{}
 			raw := append([]byte(nil), buf[:n]...)
 
 			a.mu.Lock()
@@ -652,14 +694,37 @@ func (a *ARQ) ioLoop() {
 		}
 
 		if err != nil {
-			if ne, ok := err.(interface{ Timeout() bool }); ok && ne.Timeout() {
+			switch classifyIOError(err) {
+			case ioErrorTimeout:
+				transientReadSince = time.Time{}
 				continue
-			}
-
-			if errors.Is(err, io.EOF) {
+			case ioErrorTransient:
+				now := time.Now()
+				if transientReadSince.IsZero() {
+					transientReadSince = now
+				} else if now.Sub(transientReadSince) > ioTransientReadBudget {
+					errorReason = "Repeated transient read errors: " + err.Error()
+					resetRequired = true
+					resetAfterDrain = n > 0
+					break
+				}
+				time.Sleep(ioRetryBackoff)
+				continue
+			case ioErrorEOF:
+				transientReadSince = time.Time{}
 				errorReason = "Local App Closed Connection (EOF)"
 				gracefulEOF = true
-			} else {
+			case ioErrorClosed:
+				transientReadSince = time.Time{}
+				if a.isGracefulCloseInProgress() {
+					alreadyHandled = true
+					break
+				}
+				errorReason = "Local connection closed"
+				resetRequired = true
+				resetAfterDrain = n > 0
+			default:
+				transientReadSince = time.Time{}
 				errorReason = "Read Error: " + err.Error()
 				resetRequired = true
 				resetAfterDrain = n > 0
@@ -973,16 +1038,45 @@ func (a *ARQ) writeLoop() {
 			}
 
 			for _, chunk := range toWrite {
+				remaining := chunk
+				transientRetries := 0
+				for len(remaining) > 0 {
+					a.writeLock.Lock()
+					n, err := conn.Write(remaining)
+					a.writeLock.Unlock()
+					if n > 0 {
+						remaining = remaining[n:]
+					}
+					if err == nil {
+						continue
+					}
 
-				a.writeLock.Lock()
-				_, err := conn.Write(chunk)
-				a.writeLock.Unlock()
+					class := classifyIOError(err)
+					if class == ioErrorTimeout || class == ioErrorTransient {
+						if transientRetries >= ioTransientWriteBudget {
+							if a.isGracefulCloseInProgress() {
+								return
+							}
+							a.Close("Local App Write Error: "+err.Error(), CloseOptions{SendRST: true})
+							return
+						}
+						transientRetries++
+						time.Sleep(ioRetryBackoff)
+						continue
+					}
 
-				if err != nil {
+					if class == ioErrorEOF || class == ioErrorClosed {
+						if a.isGracefulCloseInProgress() {
+							return
+						}
+						a.Close("Local App Closed Connection (writer closed)", CloseOptions{SendRST: true})
+						return
+					}
+
 					if a.isGracefulCloseInProgress() {
 						return
 					}
-					a.Close("Local App Closed Connection (writer closed)", CloseOptions{SendRST: true})
+					a.Close("Local App Write Error: "+err.Error(), CloseOptions{SendRST: true})
 					return
 				}
 			}
