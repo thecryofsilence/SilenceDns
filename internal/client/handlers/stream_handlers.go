@@ -17,6 +17,7 @@ func init() {
 	streamTypes := []uint8{
 		Enums.PACKET_STREAM_DATA,
 		Enums.PACKET_STREAM_DATA_ACK,
+		Enums.PACKET_STREAM_DATA_NACK,
 		Enums.PACKET_STREAM_RESEND,
 		Enums.PACKET_STREAM_SYN,
 		Enums.PACKET_STREAM_SYN_ACK,
