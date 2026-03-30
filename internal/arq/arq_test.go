@@ -1467,6 +1467,65 @@ func TestARQ_IOReadDataWithEOFStillQueuesFinalChunk(t *testing.T) {
 	}
 }
 
+func TestARQ_IOReadLargerChunkSegmentsByMTUAndDefersCloseRead(t *testing.T) {
+	enqueuer := NewMockPacketEnqueuer()
+	cfg := Config{
+		WindowSize:               100,
+		RTO:                      0.1,
+		MaxRTO:                   0.5,
+		EnableControlReliability: true,
+		IsClient:                 true,
+	}
+
+	payload := []byte("hello world")
+	conn := &eofAfterDataConn{data: payload}
+	a := NewARQ(1, 1, enqueuer, conn, 4, &testLogger{t}, cfg)
+	a.Start()
+	defer a.Close("test end", CloseOptions{Force: true})
+
+	var got [][]byte
+	timeout := time.After(1 * time.Second)
+	for len(got) < 3 {
+		select {
+		case p := <-enqueuer.Packets:
+			if p.packetType != Enums.PACKET_STREAM_DATA {
+				continue
+			}
+			got = append(got, append([]byte(nil), p.payload...))
+		case <-timeout:
+			t.Fatalf("timed out waiting for segmented data packets, got=%d", len(got))
+		}
+	}
+
+	expected := [][]byte{
+		[]byte("hell"),
+		[]byte("o wo"),
+		[]byte("rld"),
+	}
+	for i := range expected {
+		if !bytes.Equal(got[i], expected[i]) {
+			t.Fatalf("expected chunk %d to be %q, got %q", i, expected[i], got[i])
+		}
+		if !a.HasPendingSequence(uint16(i)) {
+			t.Fatalf("expected sequence %d to remain tracked in sndBuf", i)
+		}
+	}
+
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		a.mu.Lock()
+		deferred := a.deferredClose
+		deferredPacket := a.deferredPacket
+		a.mu.Unlock()
+		if deferred && deferredPacket == Enums.PACKET_STREAM_CLOSE_READ {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Fatal("expected segmented EOF read to arm deferred CLOSE_READ")
+}
+
 func TestARQ_ClientIOReadDataWithEOFQueuesFinalChunkAndEntersResetPath(t *testing.T) {
 	enqueuer := NewMockPacketEnqueuer()
 	cfg := Config{
@@ -1574,6 +1633,74 @@ func TestARQ_IOReadDataWithErrorDefersRSTUntilDrain(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+func TestARQ_IOReadLargerChunkSegmentsByMTUAndDefersRSTUntilDrain(t *testing.T) {
+	enqueuer := NewMockPacketEnqueuer()
+	cfg := Config{
+		WindowSize:               100,
+		RTO:                      0.1,
+		MaxRTO:                   0.5,
+		EnableControlReliability: true,
+	}
+
+	payload := []byte("chunk before read error")
+	conn := &errAfterDataConn{data: payload, err: errors.New("boom")}
+	a := NewARQ(1, 1, enqueuer, conn, 5, &testLogger{t}, cfg)
+	a.Start()
+	defer a.Close("test end", CloseOptions{Force: true})
+
+	var got [][]byte
+	timeout := time.After(1 * time.Second)
+	for len(got) < 5 {
+		select {
+		case p := <-enqueuer.Packets:
+			if p.packetType != Enums.PACKET_STREAM_DATA {
+				continue
+			}
+			got = append(got, append([]byte(nil), p.payload...))
+		case <-timeout:
+			t.Fatalf("timed out waiting for segmented error-path data packets, got=%d", len(got))
+		}
+	}
+
+	expected := [][]byte{
+		[]byte("chunk"),
+		[]byte(" befo"),
+		[]byte("re re"),
+		[]byte("ad er"),
+		[]byte("ror"),
+	}
+	for i := range expected {
+		if !bytes.Equal(got[i], expected[i]) {
+			t.Fatalf("expected chunk %d to be %q, got %q", i, expected[i], got[i])
+		}
+		if !a.HasPendingSequence(uint16(i)) {
+			t.Fatalf("expected sequence %d to remain pending for drain", i)
+		}
+	}
+
+	select {
+	case p := <-enqueuer.Packets:
+		if p.packetType == Enums.PACKET_STREAM_RST {
+			t.Fatal("expected segmented read error not to emit RST immediately before drain")
+		}
+	default:
+	}
+
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		a.mu.Lock()
+		deferred := a.deferredClose
+		deferredPacket := a.deferredPacket
+		a.mu.Unlock()
+		if deferred && deferredPacket == Enums.PACKET_STREAM_RST {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Fatal("expected segmented read error to arm deferred RST drain path")
 }
 
 func TestARQ_IOTransientReadErrorDoesNotResetStream(t *testing.T) {
