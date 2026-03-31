@@ -332,8 +332,10 @@ stop_existing_masterdnsvpn_service() {
   done <<< "$(get_port53_pids)"
 }
 
-log_header "Managing Network Ports (Port 53)"
+log_header "Stopping Existing MasterDnsVPN"
 stop_existing_masterdnsvpn_service
+
+log_header "Managing Network Ports (Port 53)"
 remove_port53_forward_rules
 
 if check_port53; then
